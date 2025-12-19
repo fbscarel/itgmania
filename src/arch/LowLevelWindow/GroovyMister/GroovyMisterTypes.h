@@ -103,12 +103,6 @@ namespace GroovyModelines
 		12.336, 640, 662, 720, 784, 480, 488, 494, 525, 2  // interlace=2 (progressive FB)
 	};
 
-	// 640x480 interlaced @60Hz (alternate arcade timing)
-	// Modeline "640x480_60,0Hz 15,7KHz" 12.324 640 648 706 784 480 483 489 524 interlace
-	constexpr GroovyModeline ARCADE_640x480i_60 = {
-		12.324, 640, 648, 706, 784, 480, 483, 489, 524, 2  // interlace=2 (progressive FB)
-	};
-
 	// 320x240 progressive @60Hz for 15kHz CRT (NTSC arcade)
 	// Modeline "320x240 NTSC (60Hz)" 6.700 320 336 367 426 240 244 247 262
 	constexpr GroovyModeline CRT15_320x240_60 = {
@@ -131,11 +125,6 @@ namespace GroovyModelines
 	// Modeline "NTSC 720x480 (60Hz)" 13.846 720 744 809 880 480 488 494 525 interlace
 	constexpr GroovyModeline CRT15_720x480i_60 = {
 		13.846, 720, 744, 809, 880, 480, 488, 494, 525, 2  // interlace=2 (progressive FB)
-	};
-
-	// Legacy VGA mode (31kHz - for VGA monitors, not CRT TVs)
-	constexpr GroovyModeline VGA_640x480_60 = {
-		25.175, 640, 656, 752, 800, 480, 490, 492, 525, 0
 	};
 }
 

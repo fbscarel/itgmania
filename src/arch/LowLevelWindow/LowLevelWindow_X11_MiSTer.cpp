@@ -30,7 +30,6 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_captureHeight(0)
 	, m_interlacedFB(true)  // Default to interlace=1, will be overridden by preferences
 	, m_progressiveScan(true)  // Default to progressive, will be overridden by preferences
-	, m_currentField(0)
 	, m_localDisplayEnabled(true)
 	, m_misterInitialized(false)
 	, m_compressionMode(GroovyLZ4Mode::LZ4)
@@ -128,6 +127,10 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 	// When progressive, we always send full frames (no field extraction)
 	if (m_progressiveScan)
 	{
+		if (m_interlacedFB)
+		{
+			LOG->Warn("LowLevelWindow_X11_MiSTer: Progressive mode overrides InterlacedFB=true");
+		}
 		m_interlacedFB = false;
 	}
 
@@ -194,7 +197,6 @@ RString LowLevelWindow_X11_MiSTer::TryVideoMode(const VideoModeParams& p, bool& 
 	m_previousField[1].resize(fieldBufferSize);
 	m_hasPreviousField[0] = false;
 	m_hasPreviousField[1] = false;
-	m_currentField = 0;
 
 	LOG->Info("LowLevelWindow_X11_MiSTer: Framebuffer allocated for %dx%d (%zu bytes), field buffer %zu bytes",
 	          m_captureWidth, m_captureHeight, bufferSize, fieldBufferSize);
@@ -354,8 +356,6 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 					std::memcpy(m_previousField[field].data(), fieldData, fieldSize);
 					m_hasPreviousField[field] = true;
 				}
-
-				m_currentField = field;
 			}
 			else
 			{
@@ -641,37 +641,6 @@ void LowLevelWindow_X11_MiSTer::ScaleVerticalHalf(const uint8_t* frame)
 	}
 }
 
-int LowLevelWindow_X11_MiSTer::CalculateNextField()
-{
-	// NOTE: This function is now legacy/unused for interlace content selection.
-	// Field selection for temporal interlacing is now based on (m_frameNumber % 2).
-	// This function is kept for reference and potential future vsync timing use.
-	//
-	// Original algorithm from GroovyMAME (drawnogpu.cpp line 400):
-	//   m_field = (vgaF1 ? 1 : 0) ^ ((m_frame - fpga.frame) % 2);
-
-	// If we have no valid status yet, just alternate based on frame number
-	if (m_lastBlitStatus.fpgaFrame == 0 && m_lastBlitStatus.frameEcho == 0)
-	{
-		return m_frameNumber % 2;
-	}
-
-	int vgaField = m_lastBlitStatus.vgaField ? 1 : 0;
-
-	// Calculate frame difference, handling potential wraparound
-	int frameDiff = static_cast<int>(m_frameNumber) - static_cast<int>(m_lastBlitStatus.fpgaFrame);
-
-	// Sanity check: if frame difference is unreasonably large (drift detected),
-	// fall back to simple alternation.
-	if (frameDiff < 0 || frameDiff > 10)
-	{
-		return m_frameNumber % 2;
-	}
-
-	// XOR current field with frame difference parity
-	return vgaField ^ (frameDiff % 2);
-}
-
 void LowLevelWindow_X11_MiSTer::RegisterFrameTime(double frameTimeMs)
 {
 	// Based on GroovyMAME drawnogpu.cpp:776-817 (nogpu_register_frametime)
@@ -821,15 +790,15 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 
 GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModeParams& p)
 {
-	// Return appropriate modeline based on resolution and progressive setting
+	// Return appropriate 15kHz CRT modeline based on resolution and scan mode
 	//
-	// Progressive mode (31kHz VGA):
-	//   Uses VGA_640x480_60 - 31kHz horizontal frequency for VGA monitors
-	//   interlace=0: True progressive scan, no field alternation
+	// Progressive mode (240p at 15kHz):
+	//   Scales 480-line content to 240 lines, uses CRT15_640x240_60
+	//   interlace=0: True progressive scan, eliminates interlace combing
 	//
-	// Interlaced mode (15kHz CRT):
-	//   interlace=1: Host sends 240-line fields separately (Phase 3 optimization)
-	//   interlace=2: Host sends 480-line frames, FPGA splits to fields (legacy)
+	// Interlaced mode (480i at 15kHz):
+	//   interlace=1: Host sends 240-line fields separately (50% bandwidth)
+	//   interlace=2: Host sends 480-line frames, FPGA splits to fields
 
 	GroovyModeline modeline;
 

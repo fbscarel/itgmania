@@ -65,7 +65,6 @@ private:
 	// Field/interlace state (Phase 3 optimization)
 	bool m_interlacedFB;        // True = interlace=1 mode (host sends fields separately)
 	bool m_progressiveScan;     // True = 240p progressive (15kHz, scaled), False = 480i interlaced
-	int m_currentField;         // Current field being processed (0=even, 1=odd)
 	GroovyStatus m_lastBlitStatus; // Cached status from last successful blit
 
 	// Configuration
@@ -100,7 +99,6 @@ private:
 	void ApplyOverscanScaling();  // Scale down content to compensate for CRT overscan
 	void ExtractField(const uint8_t* frame, int field);  // Extract 240 lines from 480-line frame
 	void ScaleVerticalHalf(const uint8_t* frame);  // Scale 480→240 for progressive mode (line averaging)
-	int CalculateNextField();     // Determine which field to send based on FPGA status (legacy, unused)
 	GroovyModeline VideoModeToModeline(const VideoModeParams& p);
 	void InitializeMiSTerFromPreferences();
 
