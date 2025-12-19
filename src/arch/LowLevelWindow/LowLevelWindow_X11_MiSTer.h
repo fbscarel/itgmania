@@ -51,6 +51,8 @@ private:
 	// Frame capture state
 	std::vector<uint8_t> m_frameBuffer;
 	std::vector<uint8_t> m_scaledBuffer;  // Buffer for overscan-adjusted output
+	std::vector<uint8_t> m_previousFrame; // For frame duplication detection
+	bool m_hasPreviousFrame;              // Valid previous frame exists
 	uint32_t m_frameNumber;
 	int m_captureWidth;
 	int m_captureHeight;

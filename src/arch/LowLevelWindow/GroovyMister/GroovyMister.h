@@ -51,6 +51,10 @@ public:
 	bool CmdBlit(const uint8_t* frameData, size_t frameSize,
 	             uint32_t frameNum, uint16_t vSync = 0);
 
+	// Frame duplication (sends only 9-byte header with dup flag)
+	// Used when current frame is identical to previous - near-zero bandwidth
+	bool CmdBlitDuplicate(uint32_t frameNum, uint16_t vSync = 0);
+
 	// Audio streaming (CMD_AUDIO) - stub for future expansion
 	// samples: 16-bit signed PCM samples
 	// sampleCount: Number of samples (not bytes)

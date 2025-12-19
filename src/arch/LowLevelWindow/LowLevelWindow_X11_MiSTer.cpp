@@ -22,6 +22,7 @@
 LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	: LowLevelWindow_X11()
 	, m_groovy(std::make_unique<GroovyMister>())
+	, m_hasPreviousFrame(false)
 	, m_frameNumber(0)
 	, m_captureWidth(0)
 	, m_captureHeight(0)
@@ -149,6 +150,8 @@ RString LowLevelWindow_X11_MiSTer::TryVideoMode(const VideoModeParams& p, bool& 
 	                    static_cast<size_t>(m_captureHeight) * 3;
 	m_frameBuffer.resize(bufferSize);
 	m_scaledBuffer.resize(bufferSize);  // Same size for overscan-scaled output
+	m_previousFrame.resize(bufferSize); // For frame duplication detection
+	m_hasPreviousFrame = false;         // Reset on mode change
 
 	LOG->Info("LowLevelWindow_X11_MiSTer: Framebuffer allocated for %dx%d (%zu bytes)",
 	          m_captureWidth, m_captureHeight, bufferSize);
@@ -213,11 +216,31 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 				outputSize = m_scaledBuffer.size();
 			}
 
-			// Send frame to MiSTer
-			bool sent = m_groovy->CmdBlit(outputBuffer,
-			                              outputSize,
-			                              m_frameNumber,
-			                              0); // vSync=0 for automatic
+			// Check for frame duplication (huge bandwidth savings on static screens)
+			bool isDuplicate = m_hasPreviousFrame &&
+			                   outputSize == m_previousFrame.size() &&
+			                   std::memcmp(outputBuffer, m_previousFrame.data(), outputSize) == 0;
+
+			bool sent = false;
+			if (isDuplicate)
+			{
+				// Frame is identical to previous - send only 9-byte header
+				sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+			}
+			else
+			{
+				// Frame is different - send full frame data
+				sent = m_groovy->CmdBlit(outputBuffer,
+				                         outputSize,
+				                         m_frameNumber,
+				                         0); // vSync=0 for automatic
+
+				// Update previous frame buffer for next comparison
+				if (m_previousFrame.size() != outputSize)
+					m_previousFrame.resize(outputSize);
+				std::memcpy(m_previousFrame.data(), outputBuffer, outputSize);
+				m_hasPreviousFrame = true;
+			}
 
 			if (sent)
 			{

@@ -238,6 +238,30 @@ bool GroovyMister::CmdBlit(const uint8_t* frameData, size_t frameSize,
 	return true;
 }
 
+bool GroovyMister::CmdBlitDuplicate(uint32_t frameNum, uint16_t vSync)
+{
+	if (!m_connected || !m_initialized)
+		return false;
+
+	// Build 9-byte duplicate header for CMD_BLIT_FIELD_VSYNC
+	// Format: cmd(1) + frame(4) + field(1) + vsync(2) + dup_flag(1)
+	uint8_t header[9];
+	header[0] = CMD_BLIT_FIELD_VSYNC;
+	std::memcpy(&header[1], &frameNum, 4);
+	header[5] = 0;  // field (0 = progressive)
+	std::memcpy(&header[6], &vSync, 2);
+	header[8] = 0x01;  // frame_dup flag
+
+	if (!SendPacket(header, 9))
+	{
+		m_droppedFrames++;
+		return false;
+	}
+
+	m_frameCount = frameNum;
+	return true;
+}
+
 bool GroovyMister::CmdAudio(const int16_t* samples, size_t sampleCount)
 {
 	// STUB: Audio streaming expansion point
