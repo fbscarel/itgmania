@@ -744,13 +744,21 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 {
 	// Frame pacing with optional FPGA position-based predictive wait.
 	//
+	// KEY INSIGHT: We calculate "time remaining in period" from the CURRENT moment,
+	// not from estimates or averages. This automatically compensates for ALL variance
+	// (game processing, capture time, send time, ACK wait) because we measure from
+	// where we ARE, not from where we thought we'd be.
+	//
+	// Previous bug: Using m_frameTimeAvg (average) instead of actual elapsed time
+	// caused timing jitter when frame processing time varied (e.g., fast scrolling).
+	//
 	// Predictive mode (m_predictiveSync=true):
 	//   Uses FPGA scanline position to calculate exactly when to send the next frame.
 	//   This maximizes input capture time by delaying as long as safely possible.
 	//   Based on GroovyMAME drawnogpu.cpp:740-770
 	//
 	// Wall-clock mode (m_predictiveSync=false):
-	//   Fixed-period timing from frame start. Simpler but doesn't adapt to FPGA state.
+	//   Fixed-period timing based on actual elapsed time since last frame.
 
 	// Wait for ACK with standard timeout
 	if (!m_groovy->WaitSync(16))
@@ -758,8 +766,13 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 		return false;
 	}
 
-	// Get FPGA status
+	// Get FPGA status and current time
 	m_lastBlitStatus = m_groovy->GetLastStatus();
+	auto now = std::chrono::steady_clock::now();
+
+	// Calculate ACTUAL elapsed time since last frame completed
+	// This includes: game processing + capture + flip + send + ACK wait
+	double elapsedMs = std::chrono::duration<double, std::milli>(now - m_timeExit).count();
 
 	// Sync frame counter from FPGA feedback to prevent drift
 	if (m_lastBlitStatus.frameEcho > 0)
@@ -792,7 +805,8 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 		if (linesToWait < 0 || linesToWait > m_vtotal * 3)
 		{
 			// Invalid calculation - fall back to wall-clock timing
-			waitMs = m_period - m_frameTimeAvg;
+			// Use actual elapsed time, not average
+			waitMs = m_period - elapsedMs;
 
 			// Log detailed FPGA status for debugging (only first few times to avoid spam)
 			static int fallbackLogCount = 0;
@@ -808,8 +822,10 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 		}
 		else
 		{
-			// Convert scanlines to milliseconds, subtract frame processing overhead
-			waitMs = (linesToWait * m_linePeriod) - m_frameTimeAvg;
+			// Convert scanlines to milliseconds
+			// Subtract actual elapsed time (not average) for precise compensation
+			double scanlineTimeMs = linesToWait * m_linePeriod;
+			waitMs = scanlineTimeMs - elapsedMs;
 
 			// Apply safety margin to avoid cutting it too close
 			waitMs -= m_fdMargin;
@@ -819,9 +835,13 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	}
 	else
 	{
-		// WALL-CLOCK FALLBACK
-		// Fixed-period timing from frame start
-		waitMs = m_period - m_frameTimeAvg;
+		// WALL-CLOCK MODE
+		// Calculate remaining time in the period based on ACTUAL elapsed time
+		// This automatically compensates for frame-to-frame variance
+		waitMs = m_period - elapsedMs;
+
+		// Apply safety margin
+		waitMs -= m_fdMargin;
 	}
 
 	// Clamp to reasonable range
@@ -832,17 +852,17 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	CollectTimingStats(waitMs, linesToWait, usedPredictive);
 
 	// Verbose logging for debugging timing issues
-	// LOG->Trace level only appears when verbose logging is enabled
 	if (usedPredictive)
 	{
-		LOG->Trace("LowLevelWindow_X11_MiSTer: FPGA[f=%u v=%u] echo[f=%u v=%u] lines=%d wait=%.2fms",
+		LOG->Trace("LowLevelWindow_X11_MiSTer: FPGA[f=%u v=%u] echo[f=%u v=%u] lines=%d elapsed=%.2fms wait=%.2fms",
 		           m_lastBlitStatus.fpgaFrame, m_lastBlitStatus.fpgaVCount,
 		           m_lastBlitStatus.frameEcho, m_lastBlitStatus.vCountEcho,
-		           linesToWait, waitMs);
+		           linesToWait, elapsedMs, waitMs);
 	}
 
-	// Calculate target time and wait
-	auto targetTime = m_timeEntry + std::chrono::microseconds(
+	// Calculate target time from NOW (not from m_timeEntry)
+	// This ensures we wait exactly waitMs from this point
+	auto targetTime = now + std::chrono::microseconds(
 		static_cast<int64_t>(waitMs * 1000.0));
 
 	// Hybrid wait: sleep for bulk, busy-wait for final precision
