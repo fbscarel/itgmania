@@ -2,8 +2,22 @@
 #include "LowLevelWindow.h"
 #include "arch/arch_default.h"
 
+#if defined(WITH_MISTER) && defined(UNIX)
+#include "LowLevelWindow_X11_MiSTer.h"
+#include "PrefsManager.h"
+#endif
+
 LowLevelWindow *LowLevelWindow::Create()
 {
+#if defined(WITH_MISTER) && defined(UNIX)
+	// Check if MiSTer output is enabled in preferences
+	if (PREFSMAN != nullptr && PREFSMAN->m_bMiSTerEnable.Get())
+	{
+		return new LowLevelWindow_X11_MiSTer;
+	}
+#endif
+
+	// Default window implementation
 	return new ARCH_LOW_LEVEL_WINDOW;
 }
 

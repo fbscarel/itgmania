@@ -443,6 +443,16 @@ else() # Unix / Linux TODO: Remember to find and locate the zip archive files.
 
   list(APPEND SMDATA_LINK_LIB ${XRANDR_LIBRARIES} ${XINERAMA_LIBRARIES})
 
+  # GroovyMiSTer CRT output support
+  if(WITH_MISTER)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LZ4 REQUIRED liblz4)
+    list(APPEND SMDATA_LINK_LIB ${LZ4_LIBRARIES})
+    target_include_directories("${SM_EXE_NAME}" PRIVATE ${LZ4_INCLUDE_DIRS})
+    target_compile_definitions("${SM_EXE_NAME}" PRIVATE WITH_MISTER)
+    message(STATUS "GroovyMiSTer support enabled (LZ4: ${LZ4_LIBRARIES})")
+  endif()
+
   list(REMOVE_DUPLICATES SMDATA_LINK_LIB)
 endif()
 

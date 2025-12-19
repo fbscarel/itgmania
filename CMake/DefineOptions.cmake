@@ -64,6 +64,7 @@ if(LINUX)
   option(WITH_XRANDR "Build with Xrandr support" ON)
   option(WITH_LIBXTST "Build with libXtst support" ON)
   option(WITH_X11 "Build with X11 support" ON)
+  option(WITH_MISTER "Build with GroovyMiSTer CRT output support" OFF)
 endif()
 
 option(WITH_MINIMAID "Build with Minimaid support." ON)

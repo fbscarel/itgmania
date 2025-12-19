@@ -344,6 +344,14 @@ public:
 	Preference<float> m_custom_songs_max_seconds;
 	Preference<float> m_custom_songs_max_megabytes;
 
+	// MiSTer/GroovyMiSTer CRT output settings
+	Preference<bool>	m_bMiSTerEnable;        // Enable MiSTer video streaming
+	Preference<RString>	m_sMiSTerIP;            // MiSTer IP address
+	Preference<int>		m_iMiSTerCompression;   // 0=RAW, 1=LZ4, 2=LZ4_HC
+	Preference<bool>	m_bMiSTerLocalDisplay;  // Also show on local display
+	Preference<int>		m_iMiSTerOverscan;      // CRT overscan compensation % (0-20)
+	Preference<int>		m_iMiSTerDeflicker;     // Interlace deflicker filter (0=off, 1=light, 2=strong)
+
 	// Debug:
 	Preference<bool>	m_bDebugMenuEnabled;
 	Preference<bool>	m_bLogToDisk;

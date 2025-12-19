@@ -143,6 +143,15 @@ else(UNIX)
                 "arch/LowLevelWindow/LowLevelWindow_X11.cpp")
     list(APPEND SMDATA_ARCH_LOWLEVEL_HPP
                 "arch/LowLevelWindow/LowLevelWindow_X11.h")
+    if(WITH_MISTER)
+      list(APPEND SMDATA_ARCH_LOWLEVEL_SRC
+                  "arch/LowLevelWindow/LowLevelWindow_X11_MiSTer.cpp"
+                  "arch/LowLevelWindow/GroovyMister/GroovyMister.cpp")
+      list(APPEND SMDATA_ARCH_LOWLEVEL_HPP
+                  "arch/LowLevelWindow/LowLevelWindow_X11_MiSTer.h"
+                  "arch/LowLevelWindow/GroovyMister/GroovyMister.h"
+                  "arch/LowLevelWindow/GroovyMister/GroovyMisterTypes.h")
+    endif()
   endif()
 endif(WIN32)
 

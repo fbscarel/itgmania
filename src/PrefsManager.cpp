@@ -317,6 +317,14 @@ PrefsManager::PrefsManager() :
 	m_custom_songs_max_seconds("CustomSongsMaxSeconds", 120.f),
 	m_custom_songs_max_megabytes("CustomSongsMaxMegabytes", 5.f),
 
+	/* MiSTer/GroovyMiSTer CRT output: */
+	m_bMiSTerEnable("MiSTerEnable", false),
+	m_sMiSTerIP("MiSTerIP", "192.168.30.81"),
+	m_iMiSTerCompression("MiSTerCompression", 1),  // 0=RAW, 1=LZ4, 2=LZ4_HC
+	m_bMiSTerLocalDisplay("MiSTerLocalDisplay", true),
+	m_iMiSTerOverscan("MiSTerOverscan", 8),  // CRT overscan compensation % (0-20)
+	m_iMiSTerDeflicker("MiSTerDeflicker", 1),  // Interlace deflicker (0=off, 1=light, 2=strong)
+
 	/* Debug: */
 	m_bDebugMenuEnabled("DebugMenuEnabled", true, nullptr, PreferenceType::Immutable),
 	m_bLogToDisk			( "LogToDisk",		true ),
