@@ -17,6 +17,7 @@
 #include "GroovyMister/GroovyMister.h"
 #include <memory>
 #include <vector>
+#include <chrono>
 
 class LowLevelWindow_X11_MiSTer : public LowLevelWindow_X11
 {
@@ -53,6 +54,7 @@ private:
 	std::vector<uint8_t> m_scaledBuffer;  // Buffer for overscan-adjusted output
 	std::vector<uint8_t> m_previousFrame; // For frame duplication detection
 	std::vector<uint8_t> m_fieldBuffer;   // Buffer for single field (240 lines for 480i)
+	std::vector<uint8_t> m_progBuffer;    // Buffer for 240p progressive (scaled from 480)
 	std::vector<uint8_t> m_previousField[2]; // Previous field data for each field (dup detection)
 	bool m_hasPreviousFrame;              // Valid previous frame exists
 	bool m_hasPreviousField[2];           // Valid previous field exists for each field
@@ -62,6 +64,7 @@ private:
 
 	// Field/interlace state (Phase 3 optimization)
 	bool m_interlacedFB;        // True = interlace=1 mode (host sends fields separately)
+	bool m_progressiveScan;     // True = 240p progressive (15kHz, scaled), False = 480i interlaced
 	int m_currentField;         // Current field being processed (0=even, 1=odd)
 	GroovyStatus m_lastBlitStatus; // Cached status from last successful blit
 
@@ -72,15 +75,39 @@ private:
 	int m_overscanPercent;  // CRT overscan compensation (0-20%)
 	int m_deflickerMode;    // Interlace deflicker filter (0=off, 1=light, 2=strong)
 
+	// Frame timing tracking (GroovyMAME-style adaptive frame delay)
+	static const int FRAME_TIME_SAMPLES = 16;
+	std::chrono::steady_clock::time_point m_timeEntry;  // When we started processing this frame
+	std::chrono::steady_clock::time_point m_timeExit;   // When we finished processing last frame
+	double m_frameTimeHistory[FRAME_TIME_SAMPLES];      // Circular buffer of frame times (ms)
+	int m_frameTimeIndex;                               // Current index in circular buffer
+	int m_frameTimeCount;                               // Number of valid samples
+	double m_frameTimeAvg;                              // Rolling average frame time (ms)
+	double m_frameTimeJitter;                           // Max deviation between consecutive samples (ms)
+
+	// Frame delay calculation
+	double m_period;           // Frame period in ms (16.67 for 60Hz)
+	double m_linePeriod;       // Line period in ms
+	double m_frameDelay;       // 0.0-1.0 frame delay factor
+	double m_fdMargin;         // Safety margin in ms (default 1.5)
+	int m_vtotal;              // Total vertical lines in modeline
+	int m_vsyncScanline;       // Calculated vsync target scanline
+
 	// Internal helpers
 	void CaptureFramebuffer();
 	void FlipFramebufferVertical();
 	void ApplyDeflickerFilter();  // Reduce interlace flicker on thin horizontal lines
 	void ApplyOverscanScaling();  // Scale down content to compensate for CRT overscan
 	void ExtractField(const uint8_t* frame, int field);  // Extract 240 lines from 480-line frame
-	int CalculateNextField();     // Determine which field to send based on FPGA status
+	void ScaleVerticalHalf(const uint8_t* frame);  // Scale 480→240 for progressive mode (line averaging)
+	int CalculateNextField();     // Determine which field to send based on FPGA status (legacy, unused)
 	GroovyModeline VideoModeToModeline(const VideoModeParams& p);
 	void InitializeMiSTerFromPreferences();
+
+	// Frame timing helpers (GroovyMAME-style adaptive frame delay)
+	void RegisterFrameTime(double frameTimeMs);  // Add sample, recalculate avg/jitter
+	void CalculateFrameDelay();                  // Compute frame_delay and vsync_scanline
+	bool WaitForVSync();                         // Predictive wait with adaptive timing
 
 	// Disable copying
 	LowLevelWindow_X11_MiSTer(const LowLevelWindow_X11_MiSTer&) = delete;

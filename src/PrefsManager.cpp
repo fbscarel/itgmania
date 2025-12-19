@@ -325,6 +325,7 @@ PrefsManager::PrefsManager() :
 	m_iMiSTerOverscan("MiSTerOverscan", 8),  // CRT overscan compensation % (0-20)
 	m_iMiSTerDeflicker("MiSTerDeflicker", 1),  // Interlace deflicker (0=off, 1=light, 2=strong)
 	m_bMiSTerInterlacedFB("MiSTerInterlacedFB", true),  // True=interlace=1 (send fields, 50% bandwidth), False=interlace=2 (send frames)
+	m_bMiSTerProgressive("MiSTerProgressive", true),  // True=240p progressive (15kHz, no interlace artifacts), False=480i interlaced
 
 	/* Debug: */
 	m_bDebugMenuEnabled("DebugMenuEnabled", true, nullptr, PreferenceType::Immutable),

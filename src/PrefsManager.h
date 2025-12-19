@@ -352,6 +352,7 @@ public:
 	Preference<int>		m_iMiSTerOverscan;      // CRT overscan compensation % (0-20)
 	Preference<int>		m_iMiSTerDeflicker;     // Interlace deflicker filter (0=off, 1=light, 2=strong)
 	Preference<bool>	m_bMiSTerInterlacedFB;  // True=interlace=1 (send fields), False=interlace=2 (send frames)
+	Preference<bool>	m_bMiSTerProgressive;   // True=240p progressive (15kHz, scaled), False=480i interlaced (15kHz)
 
 	// Debug:
 	Preference<bool>	m_bDebugMenuEnabled;

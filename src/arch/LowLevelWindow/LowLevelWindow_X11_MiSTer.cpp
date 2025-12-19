@@ -13,6 +13,8 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <cstring>
+#include <thread>
+#include <algorithm>
 
 // GL_BGR is part of GL_EXT_bgra, define if not available
 #ifndef GL_BGR
@@ -27,16 +29,31 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_captureWidth(0)
 	, m_captureHeight(0)
 	, m_interlacedFB(true)  // Default to interlace=1, will be overridden by preferences
+	, m_progressiveScan(true)  // Default to progressive, will be overridden by preferences
 	, m_currentField(0)
 	, m_localDisplayEnabled(true)
 	, m_misterInitialized(false)
 	, m_compressionMode(GroovyLZ4Mode::LZ4)
 	, m_overscanPercent(0)
 	, m_deflickerMode(0)
+	// Frame timing initialization
+	, m_frameTimeIndex(0)
+	, m_frameTimeCount(0)
+	, m_frameTimeAvg(0.0)
+	, m_frameTimeJitter(0.0)
+	, m_period(16.6667)      // 60Hz default
+	, m_linePeriod(0.0635)   // ~15.7kHz default
+	, m_frameDelay(0.0)
+	, m_fdMargin(1.5)        // 1.5ms default safety margin
+	, m_vtotal(525)          // NTSC default
+	, m_vsyncScanline(0)
 {
 	m_hasPreviousField[0] = false;
 	m_hasPreviousField[1] = false;
 	std::memset(&m_lastBlitStatus, 0, sizeof(m_lastBlitStatus));
+	std::memset(m_frameTimeHistory, 0, sizeof(m_frameTimeHistory));
+	m_timeEntry = std::chrono::steady_clock::now();
+	m_timeExit = m_timeEntry;
 	LOG->Info("LowLevelWindow_X11_MiSTer: Initializing MiSTer output driver");
 }
 
@@ -105,6 +122,14 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 	m_overscanPercent = PREFSMAN->m_iMiSTerOverscan.Get();
 	m_deflickerMode = PREFSMAN->m_iMiSTerDeflicker.Get();
 	m_interlacedFB = PREFSMAN->m_bMiSTerInterlacedFB.Get();
+	m_progressiveScan = PREFSMAN->m_bMiSTerProgressive.Get();
+
+	// Progressive mode overrides interlaced framebuffer setting
+	// When progressive, we always send full frames (no field extraction)
+	if (m_progressiveScan)
+	{
+		m_interlacedFB = false;
+	}
 
 	// Clamp overscan to valid range (0-20%)
 	if (m_overscanPercent < 0) m_overscanPercent = 0;
@@ -120,8 +145,10 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 		return;
 	}
 
-	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d, InterlacedFB=%s",
-	          m_overscanPercent, m_deflickerMode, m_interlacedFB ? "true (fields)" : "false (frames)");
+	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d, Progressive=%s, InterlacedFB=%s",
+	          m_overscanPercent, m_deflickerMode,
+	          m_progressiveScan ? "true (240p 15kHz)" : "false (480i 15kHz)",
+	          m_interlacedFB ? "true (fields)" : "false (frames)");
 
 	// Set compression mode
 	m_compressionMode = static_cast<GroovyLZ4Mode>(compressionMode);
@@ -211,6 +238,15 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 	// Capture and send frame to MiSTer if connected
 	if (m_groovy->IsConnected() && m_misterInitialized)
 	{
+		// ===== FRAME TIMING: Record entry time =====
+		auto now = std::chrono::steady_clock::now();
+		double frameTimeMs = std::chrono::duration<double, std::milli>(now - m_timeExit).count();
+		m_timeEntry = now;
+
+		// Register frame time and update adaptive timing
+		RegisterFrameTime(frameTimeMs);
+		CalculateFrameDelay();
+
 		CaptureFramebuffer();
 
 		if (!m_frameBuffer.empty())
@@ -232,12 +268,58 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 
 			bool sent = false;
 
-			// Phase 3: True interlaced mode (interlace=1)
-			// Send 240-line fields instead of full 480-line frames = 50% bandwidth reduction
-			if (m_interlacedFB && m_captureHeight >= 480)
+			// Progressive 240p mode: Scale 480→240 for true progressive scan
+			// This eliminates ALL interlace artifacts (no field separation at all)
+			if (m_progressiveScan && m_captureHeight >= 480)
 			{
-				// Calculate which field to send based on FPGA status
-				int field = CalculateNextField();
+				// Scale 480 lines to 240 using line averaging
+				ScaleVerticalHalf(frameBuffer);
+
+				const uint8_t* progData = m_progBuffer.data();
+				size_t progSize = m_progBuffer.size();
+
+				// Check for frame duplication (huge bandwidth savings on static screens)
+				bool isDuplicate = m_hasPreviousFrame &&
+				                   progSize == m_previousFrame.size() &&
+				                   std::memcmp(progData, m_previousFrame.data(), progSize) == 0;
+
+				if (isDuplicate)
+				{
+					// Frame is identical to previous - send only header
+					sent = m_groovy->CmdBlitDuplicate(m_frameNumber,
+					                                  static_cast<uint16_t>(m_vsyncScanline));
+				}
+				else
+				{
+					// Frame is different - send scaled 240-line frame
+					// Progressive mode uses CmdBlit (not CmdBlitField) since there are no fields
+					sent = m_groovy->CmdBlit(progData,
+					                         progSize,
+					                         m_frameNumber,
+					                         static_cast<uint16_t>(m_vsyncScanline));
+
+					// Update previous frame buffer for next comparison
+					if (m_previousFrame.size() != progSize)
+						m_previousFrame.resize(progSize);
+					std::memcpy(m_previousFrame.data(), progData, progSize);
+					m_hasPreviousFrame = true;
+				}
+			}
+			// Interlaced field mode (interlace=1)
+			// Send 240-line fields instead of full 480-line frames = 50% bandwidth reduction
+			else if (m_interlacedFB && m_captureHeight >= 480)
+			{
+				// TEMPORAL INTERLACING FIX:
+				// Field type is determined by frame number, not FPGA real-time state.
+				// This ensures each frame contributes a different field:
+				//   Frame 0 → even lines (field 0)
+				//   Frame 1 → odd lines (field 1)
+				//   Frame 2 → even lines (field 0)
+				//   ...
+				// This gives true 60Hz temporal sampling instead of spatial-only interlacing
+				// which caused motion choppiness (same field type from multiple consecutive frames).
+				// Frame counter is FPGA-synced after WaitSync, so fields stay aligned with display.
+				int field = m_frameNumber % 2;
 
 				// Extract the appropriate field from the full frame
 				ExtractField(frameBuffer, field);
@@ -253,16 +335,18 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 				if (isDuplicate)
 				{
 					// Field is identical to previous same-field - send only header
-					sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+					sent = m_groovy->CmdBlitDuplicate(m_frameNumber,
+					                                  static_cast<uint16_t>(m_vsyncScanline));
 				}
 				else
 				{
 					// Field is different - send field data with explicit field number
+					// Use vsync_scanline to tell FPGA when to display (reduces tearing)
 					sent = m_groovy->CmdBlitField(fieldData,
 					                              fieldSize,
 					                              m_frameNumber,
 					                              static_cast<uint8_t>(field),
-					                              0); // vSync=0 for automatic
+					                              static_cast<uint16_t>(m_vsyncScanline));
 
 					// Update previous field buffer for next comparison
 					if (m_previousField[field].size() != fieldSize)
@@ -287,15 +371,17 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 				if (isDuplicate)
 				{
 					// Frame is identical to previous - send only 9-byte header
-					sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+					sent = m_groovy->CmdBlitDuplicate(m_frameNumber,
+					                                  static_cast<uint16_t>(m_vsyncScanline));
 				}
 				else
 				{
 					// Frame is different - send full frame data
+					// Use vsync_scanline to tell FPGA when to display (reduces tearing)
 					sent = m_groovy->CmdBlit(outputBuffer,
 					                         outputSize,
 					                         m_frameNumber,
-					                         0); // vSync=0 for automatic
+					                         static_cast<uint16_t>(m_vsyncScanline));
 
 					// Update previous frame buffer for next comparison
 					if (m_previousFrame.size() != outputSize)
@@ -307,30 +393,16 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 
 			if (sent)
 			{
-				// Wait for ACK and update status (provides natural frame pacing)
-				if (m_groovy->WaitSync(16)) // 16ms timeout (~60fps)
+				// ===== FRAME TIMING: Predictive wait with adaptive timing =====
+				// WaitForVSync() implements GroovyMAME-style frame delay:
+				// - Quick poll for ACK
+				// - Calculate precise wait time based on FPGA position
+				// - Sleep/busy-wait to maximize input capture time
+				// - Sync frame counter from FPGA feedback
+				if (!WaitForVSync())
 				{
-					// Cache status for field calculation on next frame
-					m_lastBlitStatus = m_groovy->GetLastStatus();
-
-					// KEY FIX: Sync our frame counter from FPGA feedback to prevent drift
-					// This matches GroovyMAME's approach (drawnogpu.cpp line 454):
-					//   m_frame = m_blit_status.frame_req + 1;
-					// Without this, our frame counter drifts from FPGA's counter,
-					// causing the field XOR calculation to flip incorrectly and
-					// resulting in vertical flickering.
-					if (m_lastBlitStatus.frameEcho > 0)
-					{
-						m_frameNumber = m_lastBlitStatus.frameEcho + 1;
-					}
-					else
-					{
-						m_frameNumber++;
-					}
-				}
-				else
-				{
-					// WaitSync timed out - increment locally but we may be drifting
+					// WaitForVSync handles frame counter sync internally
+					// If it failed completely, just increment locally
 					m_frameNumber++;
 				}
 			}
@@ -338,6 +410,9 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 			{
 				m_frameNumber++;
 			}
+
+			// ===== FRAME TIMING: Record exit time =====
+			m_timeExit = std::chrono::steady_clock::now();
 		}
 	}
 
@@ -527,14 +602,53 @@ void LowLevelWindow_X11_MiSTer::ExtractField(const uint8_t* frame, int field)
 	}
 }
 
+void LowLevelWindow_X11_MiSTer::ScaleVerticalHalf(const uint8_t* frame)
+{
+	// Scale 480 lines to 240 lines for progressive 240p mode.
+	// Uses line averaging: each output line is the average of two input lines.
+	// This preserves thin horizontal lines better than simple decimation.
+	//
+	// Output line Y = (input line Y*2 + input line Y*2+1) / 2
+	//
+	// This eliminates interlace combing artifacts because every output frame
+	// contains ALL 240 lines derived from the SAME instant in time (no temporal
+	// field separation like in interlaced mode).
+
+	if (m_captureWidth <= 0 || m_captureHeight < 2)
+		return;
+
+	const int srcRowSize = m_captureWidth * 3;  // RGB888
+	const int dstHeight = m_captureHeight / 2;
+
+	// Ensure progressive buffer is correct size
+	size_t expectedSize = static_cast<size_t>(srcRowSize) * static_cast<size_t>(dstHeight);
+	if (m_progBuffer.size() != expectedSize)
+		m_progBuffer.resize(expectedSize);
+
+	// Average pairs of lines
+	for (int dstY = 0; dstY < dstHeight; dstY++)
+	{
+		const uint8_t* srcLine0 = &frame[(dstY * 2) * srcRowSize];
+		const uint8_t* srcLine1 = &frame[(dstY * 2 + 1) * srcRowSize];
+		uint8_t* dstLine = &m_progBuffer[dstY * srcRowSize];
+
+		// Average each pixel component (R, G, B)
+		for (int x = 0; x < srcRowSize; x++)
+		{
+			dstLine[x] = static_cast<uint8_t>((static_cast<int>(srcLine0[x]) +
+			                                   static_cast<int>(srcLine1[x])) / 2);
+		}
+	}
+}
+
 int LowLevelWindow_X11_MiSTer::CalculateNextField()
 {
-	// Determine which field to send based on FPGA status.
-	// This implements the GroovyMAME algorithm (drawnogpu.cpp line 400):
-	//   m_field = (vgaF1 ? 1 : 0) ^ ((m_frame - fpga.frame) % 2);
+	// NOTE: This function is now legacy/unused for interlace content selection.
+	// Field selection for temporal interlacing is now based on (m_frameNumber % 2).
+	// This function is kept for reference and potential future vsync timing use.
 	//
-	// The logic ensures we send the field that will be displayed next,
-	// accounting for frame latency between host and FPGA.
+	// Original algorithm from GroovyMAME (drawnogpu.cpp line 400):
+	//   m_field = (vgaF1 ? 1 : 0) ^ ((m_frame - fpga.frame) % 2);
 
 	// If we have no valid status yet, just alternate based on frame number
 	if (m_lastBlitStatus.fpgaFrame == 0 && m_lastBlitStatus.frameEcho == 0)
@@ -548,31 +662,187 @@ int LowLevelWindow_X11_MiSTer::CalculateNextField()
 	int frameDiff = static_cast<int>(m_frameNumber) - static_cast<int>(m_lastBlitStatus.fpgaFrame);
 
 	// Sanity check: if frame difference is unreasonably large (drift detected),
-	// fall back to simple alternation. This shouldn't happen often if frame
-	// counter sync is working, but provides a safety net.
+	// fall back to simple alternation.
 	if (frameDiff < 0 || frameDiff > 10)
 	{
-		// Counter drift or wraparound - just alternate based on local counter
 		return m_frameNumber % 2;
 	}
 
 	// XOR current field with frame difference parity
-	// This compensates for any lag between when we send and when FPGA displays
 	return vgaField ^ (frameDiff % 2);
+}
+
+void LowLevelWindow_X11_MiSTer::RegisterFrameTime(double frameTimeMs)
+{
+	// Based on GroovyMAME drawnogpu.cpp:776-817 (nogpu_register_frametime)
+	// Track frame-to-frame time for adaptive frame delay calculation.
+
+	// Discard invalid values (negative or > period)
+	if (frameTimeMs <= 0.0 || frameTimeMs > m_period)
+	{
+		return;
+	}
+
+	// Add to circular buffer
+	m_frameTimeHistory[m_frameTimeIndex] = frameTimeMs;
+	m_frameTimeIndex = (m_frameTimeIndex + 1) % FRAME_TIME_SAMPLES;
+	if (m_frameTimeCount < FRAME_TIME_SAMPLES)
+	{
+		m_frameTimeCount++;
+	}
+
+	// Calculate rolling average
+	double sum = 0.0;
+	for (int i = 0; i < m_frameTimeCount; i++)
+	{
+		sum += m_frameTimeHistory[i];
+	}
+	m_frameTimeAvg = sum / m_frameTimeCount;
+
+	// Calculate max jitter (max positive difference between consecutive samples)
+	// This represents the worst-case timing variation we need to account for
+	double maxDiff = 0.0;
+	for (int i = 1; i < m_frameTimeCount; i++)
+	{
+		double diff = m_frameTimeHistory[i] - m_frameTimeHistory[i - 1];
+		if (diff > 0.0 && diff > maxDiff)
+		{
+			maxDiff = diff;
+		}
+	}
+	m_frameTimeJitter = maxDiff;
+}
+
+void LowLevelWindow_X11_MiSTer::CalculateFrameDelay()
+{
+	// Based on GroovyMAME drawnogpu.cpp:885-901
+	// Calculate optimal frame delay factor based on timing stability.
+	//
+	// Higher frame delay = more time to capture late input = lower latency
+	// But too high risks missing deadlines if timing jitters
+	//
+	// Formula: frame_delay = (period - max(margin, jitter)) / period
+	// - If jitter is low, frame_delay approaches 1.0 (wait almost full period)
+	// - If jitter is high, frame_delay decreases for safety margin
+
+	double margin = std::max(m_fdMargin, m_frameTimeJitter);
+	m_frameDelay = std::max((m_period - margin) / m_period, 0.0);
+
+	// Calculate vsync scanline target
+	// For interlaced mode, we want to target the vblank region
+	// vtotal=525 for NTSC: Field 0 vblank ~240-262, Field 1 vblank ~502-525
+	// Using a high value (near vtotal) works for both fields since the FPGA
+	// handles the field timing internally
+	if (m_interlacedFB)
+	{
+		// Target late in the frame (vblank region) - around 90-95% of vtotal
+		// This gives maximum time for input while staying in safe territory
+		m_vsyncScanline = std::min(static_cast<int>(m_vtotal * 0.95), m_vtotal - 1);
+	}
+	else
+	{
+		// Progressive mode: use frame_delay calculation
+		m_vsyncScanline = std::min(static_cast<int>(m_vtotal * m_frameDelay + 1), m_vtotal);
+	}
+}
+
+bool LowLevelWindow_X11_MiSTer::WaitForVSync()
+{
+	// Simplified frame pacing: wait for ACK, then ensure consistent frame timing.
+	//
+	// The previous predictive wait based on FPGA scanline position caused
+	// massive timing variations (0ms to 16ms) depending on where the FPGA
+	// happened to be when we checked. This led to erratic frame pacing and
+	// visible judder ("arrow moves, stops, jiggles, moves").
+	//
+	// New approach: consistent frame pacing based on wall-clock time.
+	// The vsync_scanline in the blit command tells the FPGA when to display,
+	// so we don't need to precisely time our sends - just maintain steady pace.
+
+	// Wait for ACK with standard timeout
+	if (!m_groovy->WaitSync(16))
+	{
+		return false;
+	}
+
+	// Get FPGA status
+	m_lastBlitStatus = m_groovy->GetLastStatus();
+
+	// Sync frame counter from FPGA feedback to prevent drift
+	// CRITICAL: Must always increment frame counter, even when frameEcho is 0!
+	if (m_lastBlitStatus.frameEcho > 0)
+	{
+		m_frameNumber = m_lastBlitStatus.frameEcho + 1;
+	}
+	else
+	{
+		// First frame or FPGA hasn't responded yet - increment locally
+		m_frameNumber++;
+	}
+
+	// CONSISTENT FRAME PACING:
+	// Target completing this frame at exactly one period from when we started.
+	// This ensures steady ~60Hz pacing regardless of FPGA position.
+	//
+	// targetTime = when we should finish this frame and start the next
+	// We subtract a small margin (frameTimeAvg) to account for processing time,
+	// ensuring the NEXT frame's blit arrives on time.
+	double waitMs = m_period - m_frameTimeAvg;
+
+	// Clamp to reasonable range
+	if (waitMs < 1.0)
+	{
+		waitMs = 1.0;  // Minimum 1ms wait to prevent racing
+	}
+	else if (waitMs > m_period * 1.5)
+	{
+		waitMs = m_period;  // Don't wait more than 1.5 periods
+	}
+
+	auto targetTime = m_timeEntry + std::chrono::microseconds(
+		static_cast<int64_t>(waitMs * 1000.0));
+
+	// Wait for target time with hybrid sleep/busy-wait
+	while (std::chrono::steady_clock::now() < targetTime)
+	{
+		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+			targetTime - std::chrono::steady_clock::now()).count();
+
+		if (remaining > 2)
+		{
+			// Sleep for most of the wait to reduce CPU usage
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		// else busy-wait for final precision
+	}
+
+	return true;
 }
 
 GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModeParams& p)
 {
-	// Return appropriate 15kHz CRT modeline based on resolution
-	// All modelines use ~15.7kHz horizontal frequency for CRT TV compatibility
+	// Return appropriate modeline based on resolution and progressive setting
 	//
-	// Interlace modes:
+	// Progressive mode (31kHz VGA):
+	//   Uses VGA_640x480_60 - 31kHz horizontal frequency for VGA monitors
+	//   interlace=0: True progressive scan, no field alternation
+	//
+	// Interlaced mode (15kHz CRT):
 	//   interlace=1: Host sends 240-line fields separately (Phase 3 optimization)
 	//   interlace=2: Host sends 480-line frames, FPGA splits to fields (legacy)
 
 	GroovyModeline modeline;
 
-	if (p.width == 640 && p.height == 480)
+	// Progressive 240p mode at 15kHz - eliminates interlace combing artifacts
+	// Content is scaled 480→240 before sending, giving true progressive scan
+	// This is how arcade games achieved smooth motion on 15kHz CRTs
+	if (m_progressiveScan && (p.width == 640 && p.height == 480))
+	{
+		modeline = GroovyModelines::CRT15_640x240_60;
+		// CRT15_640x240_60 has interlace=0 (true progressive at 15kHz)
+		LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x240p 15kHz modeline (progressive, scaled from 480)");
+	}
+	else if (p.width == 640 && p.height == 480)
 	{
 		// 640x480 interlaced at 15kHz (NTSC TV timing)
 		modeline = GroovyModelines::CRT15_640x480i_60;
@@ -585,6 +855,7 @@ GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModePar
 		}
 		else
 		{
+			modeline.interlace = 2;  // Host sends full frames, FPGA extracts fields
 			LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x480i 15kHz modeline (interlace=2, frame mode)");
 		}
 	}
@@ -613,6 +884,7 @@ GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModePar
 		}
 		else
 		{
+			modeline.interlace = 2;  // Host sends full frames, FPGA extracts fields
 			LOG->Info("LowLevelWindow_X11_MiSTer: Using 720x480i 15kHz modeline (interlace=2, frame mode)");
 		}
 	}
@@ -635,10 +907,29 @@ GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModePar
 		}
 		else
 		{
+			modeline.interlace = 2;  // Host sends full frames, FPGA extracts fields
 			LOG->Warn("LowLevelWindow_X11_MiSTer: No modeline for %dx%d, using 640x480i 15kHz (interlace=2)",
 			          p.width, p.height);
 		}
 	}
+
+	// Calculate timing parameters for frame delay optimization
+	// Based on GroovyMAME drawnogpu.cpp:659-660
+	m_vtotal = modeline.vtotal;
+
+	// Frame period in ms: 1000 / (pclock / (htotal * vtotal)) / interlace_factor
+	// pclock is in MHz, so multiply by 1e6 to get Hz
+	double pclockHz = modeline.pclock * 1000000.0;
+	double frameRate = pclockHz / (static_cast<double>(modeline.htotal) * modeline.vtotal);
+	int interlaceFactor = (modeline.interlace != 0) ? 2 : 1;
+	m_period = 1000.0 / frameRate / interlaceFactor;
+
+	// Line period in ms: 1000 / hfreq where hfreq = pclock / htotal
+	double hfreq = pclockHz / modeline.htotal;
+	m_linePeriod = 1000.0 / hfreq;
+
+	LOG->Info("LowLevelWindow_X11_MiSTer: Timing - period=%.3fms, line=%.4fms, vtotal=%d",
+	          m_period, m_linePeriod, m_vtotal);
 
 	return modeline;
 }
