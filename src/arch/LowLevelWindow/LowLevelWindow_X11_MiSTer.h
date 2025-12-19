@@ -65,6 +65,7 @@ private:
 	// Field/interlace state (Phase 3 optimization)
 	bool m_interlacedFB;        // True = interlace=1 mode (host sends fields separately)
 	bool m_progressiveScan;     // True = 240p progressive (15kHz, scaled), False = 480i interlaced
+	bool m_predictiveSync;      // True = FPGA position-based timing, False = wall-clock timing
 	GroovyStatus m_lastBlitStatus; // Cached status from last successful blit
 
 	// Configuration
@@ -92,6 +93,21 @@ private:
 	int m_vtotal;              // Total vertical lines in modeline
 	int m_vsyncScanline;       // Calculated vsync target scanline
 
+	// Timing statistics for latency analysis
+	bool m_timingStatsEnabled;                            // Log timing stats periodically
+	static const int TIMING_STATS_INTERVAL = 300;         // Log every N frames (~5 sec at 60Hz)
+	int m_timingStatsFrameCount;                          // Frames since last stats log
+	double m_waitMsSum;                                   // Sum of waitMs values
+	double m_waitMsMin;                                   // Minimum waitMs observed
+	double m_waitMsMax;                                   // Maximum waitMs observed
+	double m_waitMsSumSq;                                 // Sum of squares for variance
+	int m_linesToWaitSum;                                 // Sum of linesToWait values
+	int m_linesToWaitMin;                                 // Minimum linesToWait observed
+	int m_linesToWaitMax;                                 // Maximum linesToWait observed
+	int m_predictiveFrames;                               // Frames using predictive timing
+	int m_wallClockFrames;                                // Frames using wall-clock fallback
+	int m_lateFrames;                                     // Frames where linesToWait was negative
+
 	// Internal helpers
 	void CaptureFramebuffer();
 	void FlipFramebufferVertical();
@@ -106,6 +122,11 @@ private:
 	void RegisterFrameTime(double frameTimeMs);  // Add sample, recalculate avg/jitter
 	void CalculateFrameDelay();                  // Compute frame_delay and vsync_scanline
 	bool WaitForVSync();                         // Predictive wait with adaptive timing
+
+	// Timing statistics helpers
+	void ResetTimingStats();                     // Reset all timing stats to initial values
+	void CollectTimingStats(double waitMs, int linesToWait, bool usedPredictive);  // Record frame timing
+	void LogTimingStats();                       // Log accumulated stats and reset
 
 	// Disable copying
 	LowLevelWindow_X11_MiSTer(const LowLevelWindow_X11_MiSTer&) = delete;

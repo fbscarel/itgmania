@@ -326,6 +326,8 @@ PrefsManager::PrefsManager() :
 	m_iMiSTerDeflicker("MiSTerDeflicker", 1),  // Interlace deflicker (0=off, 1=light, 2=strong)
 	m_bMiSTerInterlacedFB("MiSTerInterlacedFB", true),  // True=interlace=1 (send fields, 50% bandwidth), False=interlace=2 (send frames)
 	m_bMiSTerProgressive("MiSTerProgressive", true),  // True=240p progressive (15kHz, no interlace artifacts), False=480i interlaced
+	m_bMiSTerPredictiveSync("MiSTerPredictiveSync", true),  // True=FPGA position-based timing (lower latency), False=wall-clock timing
+	m_bMiSTerTimingStats("MiSTerTimingStats", false),  // Log timing statistics for latency analysis
 
 	/* Debug: */
 	m_bDebugMenuEnabled("DebugMenuEnabled", true, nullptr, PreferenceType::Immutable),

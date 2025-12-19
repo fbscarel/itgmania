@@ -13,6 +13,7 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <cstring>
+#include <cmath>
 #include <thread>
 #include <algorithm>
 
@@ -30,6 +31,7 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_captureHeight(0)
 	, m_interlacedFB(true)  // Default to interlace=1, will be overridden by preferences
 	, m_progressiveScan(true)  // Default to progressive, will be overridden by preferences
+	, m_predictiveSync(true)  // Default to FPGA position-based timing
 	, m_localDisplayEnabled(true)
 	, m_misterInitialized(false)
 	, m_compressionMode(GroovyLZ4Mode::LZ4)
@@ -46,6 +48,19 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_fdMargin(1.5)        // 1.5ms default safety margin
 	, m_vtotal(525)          // NTSC default
 	, m_vsyncScanline(0)
+	// Timing statistics initialization
+	, m_timingStatsEnabled(false)
+	, m_timingStatsFrameCount(0)
+	, m_waitMsSum(0.0)
+	, m_waitMsMin(999.0)
+	, m_waitMsMax(0.0)
+	, m_waitMsSumSq(0.0)
+	, m_linesToWaitSum(0)
+	, m_linesToWaitMin(99999)
+	, m_linesToWaitMax(0)
+	, m_predictiveFrames(0)
+	, m_wallClockFrames(0)
+	, m_lateFrames(0)
 {
 	m_hasPreviousField[0] = false;
 	m_hasPreviousField[1] = false;
@@ -122,6 +137,15 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 	m_deflickerMode = PREFSMAN->m_iMiSTerDeflicker.Get();
 	m_interlacedFB = PREFSMAN->m_bMiSTerInterlacedFB.Get();
 	m_progressiveScan = PREFSMAN->m_bMiSTerProgressive.Get();
+	m_predictiveSync = PREFSMAN->m_bMiSTerPredictiveSync.Get();
+	m_timingStatsEnabled = PREFSMAN->m_bMiSTerTimingStats.Get();
+
+	// Reset timing stats when initializing
+	if (m_timingStatsEnabled)
+	{
+		ResetTimingStats();
+		LOG->Info("LowLevelWindow_X11_MiSTer: Timing stats enabled, logging every %d frames", TIMING_STATS_INTERVAL);
+	}
 
 	// Progressive mode overrides interlaced framebuffer setting
 	// When progressive, we always send full frames (no field extraction)
@@ -148,10 +172,11 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 		return;
 	}
 
-	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d, Progressive=%s, InterlacedFB=%s",
+	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d, Progressive=%s, InterlacedFB=%s, PredictiveSync=%s",
 	          m_overscanPercent, m_deflickerMode,
 	          m_progressiveScan ? "true (240p 15kHz)" : "false (480i 15kHz)",
-	          m_interlacedFB ? "true (fields)" : "false (frames)");
+	          m_interlacedFB ? "true (fields)" : "false (frames)",
+	          m_predictiveSync ? "true (FPGA-based)" : "false (wall-clock)");
 
 	// Set compression mode
 	m_compressionMode = static_cast<GroovyLZ4Mode>(compressionMode);
@@ -717,16 +742,15 @@ void LowLevelWindow_X11_MiSTer::CalculateFrameDelay()
 
 bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 {
-	// Simplified frame pacing: wait for ACK, then ensure consistent frame timing.
+	// Frame pacing with optional FPGA position-based predictive wait.
 	//
-	// The previous predictive wait based on FPGA scanline position caused
-	// massive timing variations (0ms to 16ms) depending on where the FPGA
-	// happened to be when we checked. This led to erratic frame pacing and
-	// visible judder ("arrow moves, stops, jiggles, moves").
+	// Predictive mode (m_predictiveSync=true):
+	//   Uses FPGA scanline position to calculate exactly when to send the next frame.
+	//   This maximizes input capture time by delaying as long as safely possible.
+	//   Based on GroovyMAME drawnogpu.cpp:740-770
 	//
-	// New approach: consistent frame pacing based on wall-clock time.
-	// The vsync_scanline in the blit command tells the FPGA when to display,
-	// so we don't need to precisely time our sends - just maintain steady pace.
+	// Wall-clock mode (m_predictiveSync=false):
+	//   Fixed-period timing from frame start. Simpler but doesn't adapt to FPGA state.
 
 	// Wait for ACK with standard timeout
 	if (!m_groovy->WaitSync(16))
@@ -738,40 +762,90 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	m_lastBlitStatus = m_groovy->GetLastStatus();
 
 	// Sync frame counter from FPGA feedback to prevent drift
-	// CRITICAL: Must always increment frame counter, even when frameEcho is 0!
 	if (m_lastBlitStatus.frameEcho > 0)
 	{
 		m_frameNumber = m_lastBlitStatus.frameEcho + 1;
 	}
 	else
 	{
-		// First frame or FPGA hasn't responded yet - increment locally
 		m_frameNumber++;
 	}
 
-	// CONSISTENT FRAME PACING:
-	// Target completing this frame at exactly one period from when we started.
-	// This ensures steady ~60Hz pacing regardless of FPGA position.
-	//
-	// targetTime = when we should finish this frame and start the next
-	// We subtract a small margin (frameTimeAvg) to account for processing time,
-	// ensuring the NEXT frame's blit arrives on time.
-	double waitMs = m_period - m_frameTimeAvg;
+	double waitMs;
+	int linesToWait = 0;
+	bool usedPredictive = false;
+
+	if (m_predictiveSync && m_lastBlitStatus.frameEcho > 0)
+	{
+		// FPGA POSITION-BASED PREDICTIVE WAIT
+		// Calculate scanlines until FPGA needs our next frame.
+		//
+		// Formula from GroovyMAME:
+		//   lines_to_wait = (frameEcho - fpgaFrame) * vtotal + vCountEcho - fpgaVCount
+		//
+		// This tells us how many scanlines until the FPGA reaches the point
+		// where it will start displaying the frame we just sent.
+		linesToWait = static_cast<int>(m_lastBlitStatus.frameEcho - m_lastBlitStatus.fpgaFrame) * m_vtotal
+		            + static_cast<int>(m_lastBlitStatus.vCountEcho) - static_cast<int>(m_lastBlitStatus.fpgaVCount);
+
+		// Sanity check: if calculation seems wrong, fall back to wall-clock
+		if (linesToWait < 0 || linesToWait > m_vtotal * 3)
+		{
+			// Invalid calculation - fall back to wall-clock timing
+			waitMs = m_period - m_frameTimeAvg;
+
+			// Log detailed FPGA status for debugging (only first few times to avoid spam)
+			static int fallbackLogCount = 0;
+			if (fallbackLogCount < 10)
+			{
+				LOG->Info("LowLevelWindow_X11_MiSTer: Predictive fallback #%d: "
+				          "frameEcho=%u fpgaFrame=%u vCountEcho=%u fpgaVCount=%u vtotal=%d => lines=%d",
+				          ++fallbackLogCount,
+				          m_lastBlitStatus.frameEcho, m_lastBlitStatus.fpgaFrame,
+				          m_lastBlitStatus.vCountEcho, m_lastBlitStatus.fpgaVCount,
+				          m_vtotal, linesToWait);
+			}
+		}
+		else
+		{
+			// Convert scanlines to milliseconds, subtract frame processing overhead
+			waitMs = (linesToWait * m_linePeriod) - m_frameTimeAvg;
+
+			// Apply safety margin to avoid cutting it too close
+			waitMs -= m_fdMargin;
+
+			usedPredictive = true;
+		}
+	}
+	else
+	{
+		// WALL-CLOCK FALLBACK
+		// Fixed-period timing from frame start
+		waitMs = m_period - m_frameTimeAvg;
+	}
 
 	// Clamp to reasonable range
-	if (waitMs < 1.0)
+	waitMs = std::max(waitMs, 0.5);  // Minimum 0.5ms to prevent racing
+	waitMs = std::min(waitMs, m_period * 1.5);  // Maximum 1.5 periods
+
+	// Collect timing statistics (if enabled via MiSTerTimingStats preference)
+	CollectTimingStats(waitMs, linesToWait, usedPredictive);
+
+	// Verbose logging for debugging timing issues
+	// LOG->Trace level only appears when verbose logging is enabled
+	if (usedPredictive)
 	{
-		waitMs = 1.0;  // Minimum 1ms wait to prevent racing
-	}
-	else if (waitMs > m_period * 1.5)
-	{
-		waitMs = m_period;  // Don't wait more than 1.5 periods
+		LOG->Trace("LowLevelWindow_X11_MiSTer: FPGA[f=%u v=%u] echo[f=%u v=%u] lines=%d wait=%.2fms",
+		           m_lastBlitStatus.fpgaFrame, m_lastBlitStatus.fpgaVCount,
+		           m_lastBlitStatus.frameEcho, m_lastBlitStatus.vCountEcho,
+		           linesToWait, waitMs);
 	}
 
+	// Calculate target time and wait
 	auto targetTime = m_timeEntry + std::chrono::microseconds(
 		static_cast<int64_t>(waitMs * 1000.0));
 
-	// Wait for target time with hybrid sleep/busy-wait
+	// Hybrid wait: sleep for bulk, busy-wait for final precision
 	while (std::chrono::steady_clock::now() < targetTime)
 	{
 		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -786,6 +860,115 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	}
 
 	return true;
+}
+
+void LowLevelWindow_X11_MiSTer::ResetTimingStats()
+{
+	m_timingStatsFrameCount = 0;
+	m_waitMsSum = 0.0;
+	m_waitMsMin = 999.0;
+	m_waitMsMax = 0.0;
+	m_waitMsSumSq = 0.0;
+	m_linesToWaitSum = 0;
+	m_linesToWaitMin = 99999;
+	m_linesToWaitMax = 0;
+	m_predictiveFrames = 0;
+	m_wallClockFrames = 0;
+	m_lateFrames = 0;
+}
+
+void LowLevelWindow_X11_MiSTer::CollectTimingStats(double waitMs, int linesToWait, bool usedPredictive)
+{
+	if (!m_timingStatsEnabled)
+		return;
+
+	// Accumulate wait time statistics
+	m_waitMsSum += waitMs;
+	m_waitMsSumSq += waitMs * waitMs;
+	if (waitMs < m_waitMsMin) m_waitMsMin = waitMs;
+	if (waitMs > m_waitMsMax) m_waitMsMax = waitMs;
+
+	// Track timing mode usage
+	if (usedPredictive)
+	{
+		m_predictiveFrames++;
+		m_linesToWaitSum += linesToWait;
+		if (linesToWait < m_linesToWaitMin) m_linesToWaitMin = linesToWait;
+		if (linesToWait > m_linesToWaitMax) m_linesToWaitMax = linesToWait;
+
+		// Track late frames only when predictive was used and failed
+		// (negative linesToWait means frame arrived after target scanline)
+		if (linesToWait < 0)
+			m_lateFrames++;
+	}
+	else
+	{
+		m_wallClockFrames++;
+	}
+
+	m_timingStatsFrameCount++;
+
+	// Log and reset periodically
+	if (m_timingStatsFrameCount >= TIMING_STATS_INTERVAL)
+	{
+		LogTimingStats();
+	}
+}
+
+void LowLevelWindow_X11_MiSTer::LogTimingStats()
+{
+	if (m_timingStatsFrameCount == 0)
+		return;
+
+	// Calculate averages
+	double waitMsAvg = m_waitMsSum / m_timingStatsFrameCount;
+
+	// Calculate standard deviation: sqrt(E[X^2] - E[X]^2)
+	double variance = (m_waitMsSumSq / m_timingStatsFrameCount) - (waitMsAvg * waitMsAvg);
+	double waitMsStdDev = (variance > 0) ? std::sqrt(variance) : 0.0;
+
+	// Calculate lines average (only for predictive frames)
+	double linesAvg = (m_predictiveFrames > 0) ?
+	                  static_cast<double>(m_linesToWaitSum) / m_predictiveFrames : 0.0;
+
+	// Log comprehensive timing stats
+	LOG->Info("=== MiSTer Timing Stats (%d frames) ===", m_timingStatsFrameCount);
+	LOG->Info("  Mode: %s", m_predictiveSync ? "PREDICTIVE" : "WALL-CLOCK");
+	LOG->Info("  waitMs: avg=%.2f min=%.2f max=%.2f stddev=%.2f",
+	          waitMsAvg, m_waitMsMin, m_waitMsMax, waitMsStdDev);
+
+	if (m_predictiveFrames > 0)
+	{
+		LOG->Info("  linesToWait: avg=%.1f min=%d max=%d",
+		          linesAvg, m_linesToWaitMin, m_linesToWaitMax);
+	}
+
+	LOG->Info("  Predictive: %d frames (%.1f%%), WallClock: %d frames (%.1f%%)",
+	          m_predictiveFrames,
+	          100.0 * m_predictiveFrames / m_timingStatsFrameCount,
+	          m_wallClockFrames,
+	          100.0 * m_wallClockFrames / m_timingStatsFrameCount);
+
+	// Only show late frames warning if we actually used predictive and had issues
+	if (m_lateFrames > 0 && m_predictiveFrames > 0)
+	{
+		LOG->Warn("  Late frames: %d of %d predictive (%.1f%%) - consider increasing fdMargin",
+		          m_lateFrames, m_predictiveFrames,
+		          100.0 * m_lateFrames / m_predictiveFrames);
+	}
+
+	// Explain wall-clock fallback if it's happening frequently
+	if (m_wallClockFrames > m_predictiveFrames && m_predictiveSync)
+	{
+		LOG->Info("  Note: Wall-clock fallback due to negative linesToWait (FPGA moved past reception point)");
+		LOG->Info("  This is normal for 240p (262 lines) - network latency > scanline margin");
+	}
+
+	// Interpretation help
+	LOG->Info("  [Higher waitMs = more input capture time = lower latency]");
+
+	// Reset for next interval
+	ResetTimingStats();
 }
 
 GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModeParams& p)

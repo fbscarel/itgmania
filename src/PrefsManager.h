@@ -353,6 +353,8 @@ public:
 	Preference<int>		m_iMiSTerDeflicker;     // Interlace deflicker filter (0=off, 1=light, 2=strong)
 	Preference<bool>	m_bMiSTerInterlacedFB;  // True=interlace=1 (send fields), False=interlace=2 (send frames)
 	Preference<bool>	m_bMiSTerProgressive;   // True=240p progressive (15kHz, scaled), False=480i interlaced (15kHz)
+	Preference<bool>	m_bMiSTerPredictiveSync; // True=FPGA position-based timing, False=wall-clock timing
+	Preference<bool>	m_bMiSTerTimingStats;    // Log timing statistics for latency analysis
 
 	// Debug:
 	Preference<bool>	m_bDebugMenuEnabled;
