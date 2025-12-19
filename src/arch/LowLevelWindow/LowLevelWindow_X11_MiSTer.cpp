@@ -26,12 +26,17 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_frameNumber(0)
 	, m_captureWidth(0)
 	, m_captureHeight(0)
+	, m_interlacedFB(true)  // Default to interlace=1, will be overridden by preferences
+	, m_currentField(0)
 	, m_localDisplayEnabled(true)
 	, m_misterInitialized(false)
 	, m_compressionMode(GroovyLZ4Mode::LZ4)
 	, m_overscanPercent(0)
 	, m_deflickerMode(0)
 {
+	m_hasPreviousField[0] = false;
+	m_hasPreviousField[1] = false;
+	std::memset(&m_lastBlitStatus, 0, sizeof(m_lastBlitStatus));
 	LOG->Info("LowLevelWindow_X11_MiSTer: Initializing MiSTer output driver");
 }
 
@@ -99,6 +104,7 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 	m_localDisplayEnabled = PREFSMAN->m_bMiSTerLocalDisplay.Get();
 	m_overscanPercent = PREFSMAN->m_iMiSTerOverscan.Get();
 	m_deflickerMode = PREFSMAN->m_iMiSTerDeflicker.Get();
+	m_interlacedFB = PREFSMAN->m_bMiSTerInterlacedFB.Get();
 
 	// Clamp overscan to valid range (0-20%)
 	if (m_overscanPercent < 0) m_overscanPercent = 0;
@@ -114,8 +120,8 @@ void LowLevelWindow_X11_MiSTer::InitializeMiSTerFromPreferences()
 		return;
 	}
 
-	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d",
-	          m_overscanPercent, m_deflickerMode);
+	LOG->Info("LowLevelWindow_X11_MiSTer: Overscan=%d%%, Deflicker=%d, InterlacedFB=%s",
+	          m_overscanPercent, m_deflickerMode, m_interlacedFB ? "true (fields)" : "false (frames)");
 
 	// Set compression mode
 	m_compressionMode = static_cast<GroovyLZ4Mode>(compressionMode);
@@ -153,8 +159,18 @@ RString LowLevelWindow_X11_MiSTer::TryVideoMode(const VideoModeParams& p, bool& 
 	m_previousFrame.resize(bufferSize); // For frame duplication detection
 	m_hasPreviousFrame = false;         // Reset on mode change
 
-	LOG->Info("LowLevelWindow_X11_MiSTer: Framebuffer allocated for %dx%d (%zu bytes)",
-	          m_captureWidth, m_captureHeight, bufferSize);
+	// Allocate field buffer (half height for interlace=1 mode)
+	size_t fieldBufferSize = static_cast<size_t>(m_captureWidth) *
+	                         static_cast<size_t>(m_captureHeight / 2) * 3;
+	m_fieldBuffer.resize(fieldBufferSize);
+	m_previousField[0].resize(fieldBufferSize);
+	m_previousField[1].resize(fieldBufferSize);
+	m_hasPreviousField[0] = false;
+	m_hasPreviousField[1] = false;
+	m_currentField = 0;
+
+	LOG->Info("LowLevelWindow_X11_MiSTer: Framebuffer allocated for %dx%d (%zu bytes), field buffer %zu bytes",
+	          m_captureWidth, m_captureHeight, bufferSize, fieldBufferSize);
 
 	// Initialize MiSTer connection from preferences
 	InitializeMiSTerFromPreferences();
@@ -206,50 +222,122 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 			}
 
 			// Apply overscan scaling if enabled
-			const uint8_t* outputBuffer = m_frameBuffer.data();
-			size_t outputSize = m_frameBuffer.size();
+			const uint8_t* frameBuffer = m_frameBuffer.data();
 
 			if (m_overscanPercent > 0)
 			{
 				ApplyOverscanScaling();
-				outputBuffer = m_scaledBuffer.data();
-				outputSize = m_scaledBuffer.size();
+				frameBuffer = m_scaledBuffer.data();
 			}
 
-			// Check for frame duplication (huge bandwidth savings on static screens)
-			bool isDuplicate = m_hasPreviousFrame &&
-			                   outputSize == m_previousFrame.size() &&
-			                   std::memcmp(outputBuffer, m_previousFrame.data(), outputSize) == 0;
-
 			bool sent = false;
-			if (isDuplicate)
+
+			// Phase 3: True interlaced mode (interlace=1)
+			// Send 240-line fields instead of full 480-line frames = 50% bandwidth reduction
+			if (m_interlacedFB && m_captureHeight >= 480)
 			{
-				// Frame is identical to previous - send only 9-byte header
-				sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+				// Calculate which field to send based on FPGA status
+				int field = CalculateNextField();
+
+				// Extract the appropriate field from the full frame
+				ExtractField(frameBuffer, field);
+
+				const uint8_t* fieldData = m_fieldBuffer.data();
+				size_t fieldSize = m_fieldBuffer.size();
+
+				// Check for field duplication (per-field, not per-frame)
+				bool isDuplicate = m_hasPreviousField[field] &&
+				                   fieldSize == m_previousField[field].size() &&
+				                   std::memcmp(fieldData, m_previousField[field].data(), fieldSize) == 0;
+
+				if (isDuplicate)
+				{
+					// Field is identical to previous same-field - send only header
+					sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+				}
+				else
+				{
+					// Field is different - send field data with explicit field number
+					sent = m_groovy->CmdBlitField(fieldData,
+					                              fieldSize,
+					                              m_frameNumber,
+					                              static_cast<uint8_t>(field),
+					                              0); // vSync=0 for automatic
+
+					// Update previous field buffer for next comparison
+					if (m_previousField[field].size() != fieldSize)
+						m_previousField[field].resize(fieldSize);
+					std::memcpy(m_previousField[field].data(), fieldData, fieldSize);
+					m_hasPreviousField[field] = true;
+				}
+
+				m_currentField = field;
 			}
 			else
 			{
-				// Frame is different - send full frame data
-				sent = m_groovy->CmdBlit(outputBuffer,
-				                         outputSize,
-				                         m_frameNumber,
-				                         0); // vSync=0 for automatic
+				// Legacy mode: interlace=2 (send full frames, FPGA splits)
+				const uint8_t* outputBuffer = frameBuffer;
+				size_t outputSize = m_frameBuffer.size();
 
-				// Update previous frame buffer for next comparison
-				if (m_previousFrame.size() != outputSize)
-					m_previousFrame.resize(outputSize);
-				std::memcpy(m_previousFrame.data(), outputBuffer, outputSize);
-				m_hasPreviousFrame = true;
+				// Check for frame duplication (huge bandwidth savings on static screens)
+				bool isDuplicate = m_hasPreviousFrame &&
+				                   outputSize == m_previousFrame.size() &&
+				                   std::memcmp(outputBuffer, m_previousFrame.data(), outputSize) == 0;
+
+				if (isDuplicate)
+				{
+					// Frame is identical to previous - send only 9-byte header
+					sent = m_groovy->CmdBlitDuplicate(m_frameNumber, 0);
+				}
+				else
+				{
+					// Frame is different - send full frame data
+					sent = m_groovy->CmdBlit(outputBuffer,
+					                         outputSize,
+					                         m_frameNumber,
+					                         0); // vSync=0 for automatic
+
+					// Update previous frame buffer for next comparison
+					if (m_previousFrame.size() != outputSize)
+						m_previousFrame.resize(outputSize);
+					std::memcpy(m_previousFrame.data(), outputBuffer, outputSize);
+					m_hasPreviousFrame = true;
+				}
 			}
 
 			if (sent)
 			{
-				// Wait for ACK (provides natural frame pacing)
-				// This ensures we don't get too far ahead of the MiSTer
-				m_groovy->WaitSync(16); // 16ms timeout (~60fps)
-			}
+				// Wait for ACK and update status (provides natural frame pacing)
+				if (m_groovy->WaitSync(16)) // 16ms timeout (~60fps)
+				{
+					// Cache status for field calculation on next frame
+					m_lastBlitStatus = m_groovy->GetLastStatus();
 
-			m_frameNumber++;
+					// KEY FIX: Sync our frame counter from FPGA feedback to prevent drift
+					// This matches GroovyMAME's approach (drawnogpu.cpp line 454):
+					//   m_frame = m_blit_status.frame_req + 1;
+					// Without this, our frame counter drifts from FPGA's counter,
+					// causing the field XOR calculation to flip incorrectly and
+					// resulting in vertical flickering.
+					if (m_lastBlitStatus.frameEcho > 0)
+					{
+						m_frameNumber = m_lastBlitStatus.frameEcho + 1;
+					}
+					else
+					{
+						m_frameNumber++;
+					}
+				}
+				else
+				{
+					// WaitSync timed out - increment locally but we may be drifting
+					m_frameNumber++;
+				}
+			}
+			else
+			{
+				m_frameNumber++;
+			}
 		}
 	}
 
@@ -405,48 +493,154 @@ void LowLevelWindow_X11_MiSTer::ApplyOverscanScaling()
 	}
 }
 
+void LowLevelWindow_X11_MiSTer::ExtractField(const uint8_t* frame, int field)
+{
+	// Extract one field (half the lines) from a full frame for interlace=1 mode.
+	// field=0 (even): extract lines 0, 2, 4, 6... (top field)
+	// field=1 (odd):  extract lines 1, 3, 5, 7... (bottom field)
+	//
+	// This implements the same algorithm as GroovyMAME (drawnogpu.cpp lines 403-418):
+	//   int lstart = pitch * m_field;         // Start at line 0 or 1
+	//   int lstep = pitch * interlace_factor; // Step by 2 lines
+
+	if (m_captureWidth <= 0 || m_captureHeight < 2)
+		return;
+
+	const int srcRowSize = m_captureWidth * 3;
+	const int fieldHeight = m_captureHeight / 2;
+
+	// Ensure field buffer is correct size
+	size_t expectedSize = static_cast<size_t>(srcRowSize) * static_cast<size_t>(fieldHeight);
+	if (m_fieldBuffer.size() != expectedSize)
+		m_fieldBuffer.resize(expectedSize);
+
+	// Extract every other line starting from 'field'
+	// field=0: lines 0,2,4,6... -> dstY 0,1,2,3...
+	// field=1: lines 1,3,5,7... -> dstY 0,1,2,3...
+	int srcY = field;  // Start at line 0 (even) or 1 (odd)
+	for (int dstY = 0; dstY < fieldHeight; dstY++)
+	{
+		std::memcpy(&m_fieldBuffer[dstY * srcRowSize],
+		            &frame[srcY * srcRowSize],
+		            srcRowSize);
+		srcY += 2;  // Skip to next line of same field
+	}
+}
+
+int LowLevelWindow_X11_MiSTer::CalculateNextField()
+{
+	// Determine which field to send based on FPGA status.
+	// This implements the GroovyMAME algorithm (drawnogpu.cpp line 400):
+	//   m_field = (vgaF1 ? 1 : 0) ^ ((m_frame - fpga.frame) % 2);
+	//
+	// The logic ensures we send the field that will be displayed next,
+	// accounting for frame latency between host and FPGA.
+
+	// If we have no valid status yet, just alternate based on frame number
+	if (m_lastBlitStatus.fpgaFrame == 0 && m_lastBlitStatus.frameEcho == 0)
+	{
+		return m_frameNumber % 2;
+	}
+
+	int vgaField = m_lastBlitStatus.vgaField ? 1 : 0;
+
+	// Calculate frame difference, handling potential wraparound
+	int frameDiff = static_cast<int>(m_frameNumber) - static_cast<int>(m_lastBlitStatus.fpgaFrame);
+
+	// Sanity check: if frame difference is unreasonably large (drift detected),
+	// fall back to simple alternation. This shouldn't happen often if frame
+	// counter sync is working, but provides a safety net.
+	if (frameDiff < 0 || frameDiff > 10)
+	{
+		// Counter drift or wraparound - just alternate based on local counter
+		return m_frameNumber % 2;
+	}
+
+	// XOR current field with frame difference parity
+	// This compensates for any lag between when we send and when FPGA displays
+	return vgaField ^ (frameDiff % 2);
+}
+
 GroovyModeline LowLevelWindow_X11_MiSTer::VideoModeToModeline(const VideoModeParams& p)
 {
 	// Return appropriate 15kHz CRT modeline based on resolution
 	// All modelines use ~15.7kHz horizontal frequency for CRT TV compatibility
+	//
+	// Interlace modes:
+	//   interlace=1: Host sends 240-line fields separately (Phase 3 optimization)
+	//   interlace=2: Host sends 480-line frames, FPGA splits to fields (legacy)
+
+	GroovyModeline modeline;
 
 	if (p.width == 640 && p.height == 480)
 	{
 		// 640x480 interlaced at 15kHz (NTSC TV timing)
-		LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x480i 15kHz modeline");
-		return GroovyModelines::CRT15_640x480i_60;
+		modeline = GroovyModelines::CRT15_640x480i_60;
+
+		// Phase 3: Use interlace=1 for true field separation (50% bandwidth reduction)
+		if (m_interlacedFB)
+		{
+			modeline.interlace = 1;  // Host sends fields
+			LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x480i 15kHz modeline (interlace=1, field mode)");
+		}
+		else
+		{
+			LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x480i 15kHz modeline (interlace=2, frame mode)");
+		}
 	}
 	else if (p.width == 640 && p.height == 240)
 	{
 		// 640x240 progressive at 15kHz
+		modeline = GroovyModelines::CRT15_640x240_60;
 		LOG->Info("LowLevelWindow_X11_MiSTer: Using 640x240p 15kHz modeline");
-		return GroovyModelines::CRT15_640x240_60;
 	}
 	else if (p.width == 320 && p.height == 240)
 	{
 		// 320x240 progressive at 15kHz (arcade standard)
+		modeline = GroovyModelines::CRT15_320x240_60;
 		LOG->Info("LowLevelWindow_X11_MiSTer: Using 320x240p 15kHz modeline");
-		return GroovyModelines::CRT15_320x240_60;
 	}
 	else if (p.width == 720 && p.height == 480)
 	{
 		// 720x480 interlaced at 15kHz (NTSC DVD)
-		LOG->Info("LowLevelWindow_X11_MiSTer: Using 720x480i 15kHz modeline");
-		return GroovyModelines::CRT15_720x480i_60;
+		modeline = GroovyModelines::CRT15_720x480i_60;
+
+		// Phase 3: Use interlace=1 for true field separation
+		if (m_interlacedFB)
+		{
+			modeline.interlace = 1;
+			LOG->Info("LowLevelWindow_X11_MiSTer: Using 720x480i 15kHz modeline (interlace=1, field mode)");
+		}
+		else
+		{
+			LOG->Info("LowLevelWindow_X11_MiSTer: Using 720x480i 15kHz modeline (interlace=2, frame mode)");
+		}
 	}
 	else if (p.width == 256 && p.height == 240)
 	{
 		// 256x240 progressive (NES/SNES)
+		modeline = GroovyModelines::CRT15_256x240_60;
 		LOG->Info("LowLevelWindow_X11_MiSTer: Using 256x240p 15kHz modeline");
-		return GroovyModelines::CRT15_256x240_60;
 	}
 	else
 	{
 		// Default to 640x480i for 15kHz CRT
-		LOG->Warn("LowLevelWindow_X11_MiSTer: No modeline for %dx%d, using 640x480i 15kHz",
-		          p.width, p.height);
-		return GroovyModelines::CRT15_640x480i_60;
+		modeline = GroovyModelines::CRT15_640x480i_60;
+
+		if (m_interlacedFB)
+		{
+			modeline.interlace = 1;
+			LOG->Warn("LowLevelWindow_X11_MiSTer: No modeline for %dx%d, using 640x480i 15kHz (interlace=1)",
+			          p.width, p.height);
+		}
+		else
+		{
+			LOG->Warn("LowLevelWindow_X11_MiSTer: No modeline for %dx%d, using 640x480i 15kHz (interlace=2)",
+			          p.width, p.height);
+		}
 	}
+
+	return modeline;
 }
 
 /*

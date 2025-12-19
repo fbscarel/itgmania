@@ -69,8 +69,11 @@ struct GroovyStatus
 	bool vramReady;         // Bit 0: VRAM ready for next frame
 	bool vramEndFrame;      // Bit 1: End of frame reached
 	bool vramSynced;        // Bit 2: Frame sync achieved
+	bool vgaFrameskip;      // Bit 3: Framebuffer was used (frameskip occurred)
 	bool vgaVblank;         // Bit 4: In vertical blanking
+	bool vgaField;          // Bit 5: Current field (0=even, 1=odd) - CRITICAL for interlace=1
 	bool audioEnabled;      // Bit 6: Audio streaming active
+	bool vramQueue;         // Bit 7: Pixels queued in VRAM
 };
 
 // Modeline definition for CMD_SWITCHRES (25 bytes of data after command)

@@ -51,6 +51,16 @@ public:
 	bool CmdBlit(const uint8_t* frameData, size_t frameSize,
 	             uint32_t frameNum, uint16_t vSync = 0);
 
+	// Field blitting for interlace=1 mode (CMD_BLIT_FIELD_VSYNC)
+	// Sends a single field (half frame) for true interlaced output
+	// fieldData: RGB pixel data for one field (240 lines for 480i)
+	// fieldSize: Size in bytes (half of full frame)
+	// frameNum: Sequential frame number
+	// field: Which field (0=even lines 0,2,4..., 1=odd lines 1,3,5...)
+	// vSync: Scanline to sync with (0 = automatic)
+	bool CmdBlitField(const uint8_t* fieldData, size_t fieldSize,
+	                  uint32_t frameNum, uint8_t field, uint16_t vSync = 0);
+
 	// Frame duplication (sends only 9-byte header with dup flag)
 	// Used when current frame is identical to previous - near-zero bandwidth
 	bool CmdBlitDuplicate(uint32_t frameNum, uint16_t vSync = 0);

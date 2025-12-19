@@ -52,10 +52,18 @@ private:
 	std::vector<uint8_t> m_frameBuffer;
 	std::vector<uint8_t> m_scaledBuffer;  // Buffer for overscan-adjusted output
 	std::vector<uint8_t> m_previousFrame; // For frame duplication detection
+	std::vector<uint8_t> m_fieldBuffer;   // Buffer for single field (240 lines for 480i)
+	std::vector<uint8_t> m_previousField[2]; // Previous field data for each field (dup detection)
 	bool m_hasPreviousFrame;              // Valid previous frame exists
+	bool m_hasPreviousField[2];           // Valid previous field exists for each field
 	uint32_t m_frameNumber;
 	int m_captureWidth;
 	int m_captureHeight;
+
+	// Field/interlace state (Phase 3 optimization)
+	bool m_interlacedFB;        // True = interlace=1 mode (host sends fields separately)
+	int m_currentField;         // Current field being processed (0=even, 1=odd)
+	GroovyStatus m_lastBlitStatus; // Cached status from last successful blit
 
 	// Configuration
 	bool m_localDisplayEnabled;
@@ -69,6 +77,8 @@ private:
 	void FlipFramebufferVertical();
 	void ApplyDeflickerFilter();  // Reduce interlace flicker on thin horizontal lines
 	void ApplyOverscanScaling();  // Scale down content to compensate for CRT overscan
+	void ExtractField(const uint8_t* frame, int field);  // Extract 240 lines from 480-line frame
+	int CalculateNextField();     // Determine which field to send based on FPGA status
 	GroovyModeline VideoModeToModeline(const VideoModeParams& p);
 	void InitializeMiSTerFromPreferences();
 

@@ -351,6 +351,7 @@ public:
 	Preference<bool>	m_bMiSTerLocalDisplay;  // Also show on local display
 	Preference<int>		m_iMiSTerOverscan;      // CRT overscan compensation % (0-20)
 	Preference<int>		m_iMiSTerDeflicker;     // Interlace deflicker filter (0=off, 1=light, 2=strong)
+	Preference<bool>	m_bMiSTerInterlacedFB;  // True=interlace=1 (send fields), False=interlace=2 (send frames)
 
 	// Debug:
 	Preference<bool>	m_bDebugMenuEnabled;

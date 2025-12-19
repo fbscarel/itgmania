@@ -238,6 +238,65 @@ bool GroovyMister::CmdBlit(const uint8_t* frameData, size_t frameSize,
 	return true;
 }
 
+bool GroovyMister::CmdBlitField(const uint8_t* fieldData, size_t fieldSize,
+                                 uint32_t frameNum, uint8_t field, uint16_t vSync)
+{
+	if (!m_connected || !m_initialized)
+		return false;
+
+	const uint8_t* dataToSend = fieldData;
+	size_t sizeToSend = fieldSize;
+	uint8_t cmd = CMD_BLIT_VSYNC;
+	size_t headerSize = 8;
+
+	// Compress if enabled
+	if (m_lz4Mode != GroovyLZ4Mode::RAW)
+	{
+		size_t compSize = CompressFrame(fieldData, fieldSize,
+		                                m_compressBuffer.data(),
+		                                m_compressBuffer.size());
+
+		// Only use compressed data if it's smaller
+		if (compSize > 0 && compSize < fieldSize)
+		{
+			dataToSend = m_compressBuffer.data();
+			sizeToSend = compSize;
+			cmd = CMD_BLIT_FIELD_VSYNC;
+			headerSize = 12;
+		}
+	}
+
+	// Build header with explicit field byte
+	uint8_t header[12];
+	header[0] = cmd;
+	std::memcpy(&header[1], &frameNum, 4);
+	header[5] = field;  // Field 0 or 1 for interlaced mode
+	std::memcpy(&header[6], &vSync, 2);
+
+	if (cmd == CMD_BLIT_FIELD_VSYNC)
+	{
+		uint32_t compSize32 = static_cast<uint32_t>(sizeToSend);
+		std::memcpy(&header[8], &compSize32, 4);
+	}
+
+	// Send header
+	if (!SendPacket(header, headerSize))
+	{
+		m_droppedFrames++;
+		return false;
+	}
+
+	// Send field data
+	if (!SendFrame(dataToSend, sizeToSend))
+	{
+		m_droppedFrames++;
+		return false;
+	}
+
+	m_frameCount = frameNum;
+	return true;
+}
+
 bool GroovyMister::CmdBlitDuplicate(uint32_t frameNum, uint16_t vSync)
 {
 	if (!m_connected || !m_initialized)
@@ -342,12 +401,16 @@ bool GroovyMister::ReceiveAck()
 		std::memcpy(&m_lastStatus.fpgaFrame, data + 6, 4);
 		std::memcpy(&m_lastStatus.fpgaVCount, data + 10, 2);
 
+		// Parse all status bits (byte 12)
 		uint8_t flags = data[12];
-		m_lastStatus.vramReady = (flags & 0x01) != 0;
-		m_lastStatus.vramEndFrame = (flags & 0x02) != 0;
-		m_lastStatus.vramSynced = (flags & 0x04) != 0;
-		m_lastStatus.vgaVblank = (flags & 0x10) != 0;
-		m_lastStatus.audioEnabled = (flags & 0x40) != 0;
+		m_lastStatus.vramReady = (flags & 0x01) != 0;     // Bit 0
+		m_lastStatus.vramEndFrame = (flags & 0x02) != 0;  // Bit 1
+		m_lastStatus.vramSynced = (flags & 0x04) != 0;    // Bit 2
+		m_lastStatus.vgaFrameskip = (flags & 0x08) != 0;  // Bit 3
+		m_lastStatus.vgaVblank = (flags & 0x10) != 0;     // Bit 4
+		m_lastStatus.vgaField = (flags & 0x20) != 0;      // Bit 5 - CRITICAL for interlace=1
+		m_lastStatus.audioEnabled = (flags & 0x40) != 0;  // Bit 6
+		m_lastStatus.vramQueue = (flags & 0x80) != 0;     // Bit 7
 
 		return true;
 	}
