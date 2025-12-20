@@ -78,12 +78,14 @@ private:
 	// Frame timing tracking (GroovyMAME-style adaptive frame delay)
 	static const int FRAME_TIME_SAMPLES = 16;
 	std::chrono::steady_clock::time_point m_timeEntry;  // When we started processing this frame
+	std::chrono::steady_clock::time_point m_timeBlit;   // When blit was sent (for adaptive timeout)
 	std::chrono::steady_clock::time_point m_timeExit;   // When we finished processing last frame
 	double m_frameTimeHistory[FRAME_TIME_SAMPLES];      // Circular buffer of frame times (ms)
 	int m_frameTimeIndex;                               // Current index in circular buffer
 	int m_frameTimeCount;                               // Number of valid samples
 	double m_frameTimeAvg;                              // Rolling average frame time (ms)
 	double m_frameTimeJitter;                           // Max deviation between consecutive samples (ms)
+	bool m_firstBlit;                                   // True until first frame is processed
 
 	// Frame delay calculation
 	double m_period;           // Frame period in ms (16.67 for 60Hz)
@@ -107,6 +109,7 @@ private:
 	int m_predictiveFrames;                               // Frames using predictive timing
 	int m_wallClockFrames;                                // Frames using wall-clock fallback
 	int m_lateFrames;                                     // Frames where linesToWait was negative
+	int m_frameSkips;                                     // Frames skipped due to backpressure (frame_gpu > frame_req)
 
 	// Internal helpers
 	void CaptureFramebuffer();

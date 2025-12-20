@@ -42,6 +42,8 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_frameTimeCount(0)
 	, m_frameTimeAvg(0.0)
 	, m_frameTimeJitter(0.0)
+	, m_firstBlit(true)
+	// Frame delay calculation
 	, m_period(16.6667)      // 60Hz default
 	, m_linePeriod(0.0635)   // ~15.7kHz default
 	, m_frameDelay(0.0)
@@ -61,12 +63,14 @@ LowLevelWindow_X11_MiSTer::LowLevelWindow_X11_MiSTer()
 	, m_predictiveFrames(0)
 	, m_wallClockFrames(0)
 	, m_lateFrames(0)
+	, m_frameSkips(0)
 {
 	m_hasPreviousField[0] = false;
 	m_hasPreviousField[1] = false;
 	std::memset(&m_lastBlitStatus, 0, sizeof(m_lastBlitStatus));
 	std::memset(m_frameTimeHistory, 0, sizeof(m_frameTimeHistory));
 	m_timeEntry = std::chrono::steady_clock::now();
+	m_timeBlit = m_timeEntry;
 	m_timeExit = m_timeEntry;
 	LOG->Info("LowLevelWindow_X11_MiSTer: Initializing MiSTer output driver");
 }
@@ -276,6 +280,26 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 
 		CaptureFramebuffer();
 
+		// ===== FIRST FRAME SKIP (GroovyMAME Key Mechanism #4) =====
+		// Skip the first frame to establish timing baseline without queuing pressure.
+		// This ensures we have valid timing references before streaming begins.
+		// See GroovyMAME drawnogpu.cpp lines 427-438
+		if (m_firstBlit)
+		{
+			m_timeBlit = m_timeEntry;
+			m_timeExit = m_timeEntry;
+			m_firstBlit = false;
+			m_frameNumber = 1;
+			LOG->Info("LowLevelWindow_X11_MiSTer: First frame skip - timing baseline established");
+
+			// Still swap local display
+			if (m_localDisplayEnabled)
+			{
+				LowLevelWindow_X11::SwapBuffers();
+			}
+			return;
+		}
+
 		if (!m_frameBuffer.empty())
 		{
 			// Apply deflicker filter to reduce interlace flicker on thin lines
@@ -415,6 +439,10 @@ void LowLevelWindow_X11_MiSTer::SwapBuffers()
 					m_hasPreviousFrame = true;
 				}
 			}
+
+			// ===== FRAME TIMING: Record blit time =====
+			// This is used for adaptive ACK timeout calculation
+			m_timeBlit = std::chrono::steady_clock::now();
 
 			if (sent)
 			{
@@ -742,41 +770,63 @@ void LowLevelWindow_X11_MiSTer::CalculateFrameDelay()
 
 bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 {
-	// Frame pacing with optional FPGA position-based predictive wait.
+	// =========================================================================
+	// GroovyMAME-style Frame Pacing with All 4 Key Mechanisms
+	// =========================================================================
 	//
-	// KEY INSIGHT: We calculate "time remaining in period" from the CURRENT moment,
-	// not from estimates or averages. This automatically compensates for ALL variance
-	// (game processing, capture time, send time, ACK wait) because we measure from
-	// where we ARE, not from where we thought we'd be.
+	// This implements the same timing strategy as GroovyMAME drawnogpu.cpp to
+	// prevent frame queue buildup and ensure every frame is displayed.
 	//
-	// Previous bug: Using m_frameTimeAvg (average) instead of actual elapsed time
-	// caused timing jitter when frame processing time varied (e.g., fast scrolling).
+	// Key Mechanisms:
+	// 1. ADAPTIVE ACK TIMEOUT: timeout = period - time_since_blit (not fixed 16ms)
+	// 2. RENDER-TIME COMPENSATION: target -= time_frame_avg (accounts for render time)
+	// 3. BACKPRESSURE CHECK: if frame_gpu > frame_req, skip ahead
+	// 4. TARGET FROM ENTRY TIME: Calculate wait target from frame start, not from now
 	//
-	// Predictive mode (m_predictiveSync=true):
-	//   Uses FPGA scanline position to calculate exactly when to send the next frame.
-	//   This maximizes input capture time by delaying as long as safely possible.
-	//   Based on GroovyMAME drawnogpu.cpp:740-770
-	//
-	// Wall-clock mode (m_predictiveSync=false):
-	//   Fixed-period timing based on actual elapsed time since last frame.
+	// Reference: GroovyMAME drawnogpu.cpp lines 705-772 (nogpu_wait_status)
+	// =========================================================================
 
-	// Wait for ACK with standard timeout
-	if (!m_groovy->WaitSync(16))
+	// ===== MECHANISM #1: ADAPTIVE ACK TIMEOUT =====
+	// Calculate timeout based on time already spent, not a fixed value.
+	// If we've already used 14ms of our 16.67ms period, only wait 2.67ms for ACK.
+	// See GroovyMAME drawnogpu.cpp line 451
+	double timeSinceExitMs = std::chrono::duration<double, std::milli>(
+		m_timeBlit - m_timeExit).count();
+	double ackTimeoutMs = std::max(2.0, m_period - timeSinceExitMs);
+
+	// Wait for ACK with adaptive timeout
+	if (!m_groovy->WaitSync(static_cast<uint32_t>(ackTimeoutMs)))
 	{
 		return false;
 	}
 
-	// Get FPGA status and current time
+	// Get FPGA status
 	m_lastBlitStatus = m_groovy->GetLastStatus();
-	auto now = std::chrono::steady_clock::now();
 
-	// Calculate ACTUAL elapsed time since last frame completed
-	// This includes: game processing + capture + flip + send + ACK wait
-	double elapsedMs = std::chrono::duration<double, std::milli>(now - m_timeExit).count();
-
-	// Sync frame counter from FPGA feedback to prevent drift
-	if (m_lastBlitStatus.frameEcho > 0)
+	// ===== MECHANISM #3: BACKPRESSURE CHECK =====
+	// If FPGA's display frame has passed our acknowledged frame, we've fallen behind.
+	// Skip ahead to prevent queue buildup. This is the key anti-queue mechanism.
+	// See GroovyMAME drawnogpu.cpp lines 768-769
+	if (m_lastBlitStatus.fpgaFrame > m_lastBlitStatus.frameEcho)
 	{
+		// FPGA display has moved past what it acknowledged receiving - frames were dropped!
+		// Skip ahead to fpgaFrame + 1 to resync
+		m_frameNumber = m_lastBlitStatus.fpgaFrame + 1;
+		m_frameSkips++;
+
+		static int skipLogCount = 0;
+		if (skipLogCount < 20)
+		{
+			LOG->Warn("LowLevelWindow_X11_MiSTer: Backpressure skip #%d: "
+			          "fpgaFrame=%u > frameEcho=%u, jumping to frame %u",
+			          ++skipLogCount,
+			          m_lastBlitStatus.fpgaFrame, m_lastBlitStatus.frameEcho,
+			          m_frameNumber);
+		}
+	}
+	else if (m_lastBlitStatus.frameEcho > 0)
+	{
+		// Normal case: sync to received frame
 		m_frameNumber = m_lastBlitStatus.frameEcho + 1;
 	}
 	else
@@ -793,42 +843,57 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 		// FPGA POSITION-BASED PREDICTIVE WAIT
 		// Calculate scanlines until FPGA needs our next frame.
 		//
-		// Formula from GroovyMAME:
-		//   lines_to_wait = (frameEcho - fpgaFrame) * vtotal + vCountEcho - fpgaVCount
-		//
-		// This tells us how many scanlines until the FPGA reaches the point
-		// where it will start displaying the frame we just sent.
+		// Formula from GroovyMAME drawnogpu.cpp line 741:
+		//   lines_to_wait = (frame_req - frame_gpu) * vtotal + vcount_req - vcount_gpu
 		linesToWait = static_cast<int>(m_lastBlitStatus.frameEcho - m_lastBlitStatus.fpgaFrame) * m_vtotal
 		            + static_cast<int>(m_lastBlitStatus.vCountEcho) - static_cast<int>(m_lastBlitStatus.fpgaVCount);
+
+		// For interlaced mode, divide by 2 (see GroovyMAME line 742-743)
+		if (m_interlacedFB)
+		{
+			linesToWait /= 2;
+		}
 
 		// Sanity check: if calculation seems wrong, fall back to wall-clock
 		if (linesToWait < 0 || linesToWait > m_vtotal * 3)
 		{
 			// Invalid calculation - fall back to wall-clock timing
-			// Use actual elapsed time, not average
-			waitMs = m_period - elapsedMs;
+			double elapsedMs = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - m_timeExit).count();
+			waitMs = m_period - elapsedMs - m_fdMargin;
 
-			// Log detailed FPGA status for debugging (only first few times to avoid spam)
 			static int fallbackLogCount = 0;
 			if (fallbackLogCount < 10)
 			{
 				LOG->Info("LowLevelWindow_X11_MiSTer: Predictive fallback #%d: "
-				          "frameEcho=%u fpgaFrame=%u vCountEcho=%u fpgaVCount=%u vtotal=%d => lines=%d",
+				          "frameEcho=%u fpgaFrame=%u vCountEcho=%u fpgaVCount=%u => lines=%d",
 				          ++fallbackLogCount,
 				          m_lastBlitStatus.frameEcho, m_lastBlitStatus.fpgaFrame,
 				          m_lastBlitStatus.vCountEcho, m_lastBlitStatus.fpgaVCount,
-				          m_vtotal, linesToWait);
+				          linesToWait);
 			}
 		}
 		else
 		{
-			// Convert scanlines to milliseconds
-			// Subtract actual elapsed time (not average) for precise compensation
+			// ===== MECHANISM #2 & #4: RENDER-TIME COMPENSATION & TARGET FROM ENTRY =====
+			// Calculate target time for when NEXT frame should START rendering.
+			// This is the key insight from GroovyMAME drawnogpu.cpp line 746:
+			//   time_target = time_entry + lines_to_wait_in_ticks - time_frame_avg
+			//
+			// By subtracting time_frame_avg, we account for how long rendering takes.
+			// This ensures the NEXT frame FINISHES exactly when the FPGA needs it.
 			double scanlineTimeMs = linesToWait * m_linePeriod;
-			waitMs = scanlineTimeMs - elapsedMs;
 
-			// Apply safety margin to avoid cutting it too close
-			waitMs -= m_fdMargin;
+			// Target = time_entry + FPGA_wait_time - average_render_time - safety_margin
+			// This gives us the absolute time when next frame should start
+			auto targetTime = m_timeEntry +
+				std::chrono::microseconds(static_cast<int64_t>(scanlineTimeMs * 1000.0)) -
+				std::chrono::microseconds(static_cast<int64_t>(m_frameTimeAvg * 1000.0)) -
+				std::chrono::microseconds(static_cast<int64_t>(m_fdMargin * 1000.0));
+
+			// Calculate how long to wait from NOW to reach target
+			auto now = std::chrono::steady_clock::now();
+			waitMs = std::chrono::duration<double, std::milli>(targetTime - now).count();
 
 			usedPredictive = true;
 		}
@@ -836,12 +901,9 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	else
 	{
 		// WALL-CLOCK MODE
-		// Calculate remaining time in the period based on ACTUAL elapsed time
-		// This automatically compensates for frame-to-frame variance
-		waitMs = m_period - elapsedMs;
-
-		// Apply safety margin
-		waitMs -= m_fdMargin;
+		double elapsedMs = std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - m_timeExit).count();
+		waitMs = m_period - elapsedMs - m_fdMargin;
 	}
 
 	// Clamp to reasonable range
@@ -852,20 +914,17 @@ bool LowLevelWindow_X11_MiSTer::WaitForVSync()
 	CollectTimingStats(waitMs, linesToWait, usedPredictive);
 
 	// Verbose logging for debugging timing issues
-	if (usedPredictive)
-	{
-		LOG->Trace("LowLevelWindow_X11_MiSTer: FPGA[f=%u v=%u] echo[f=%u v=%u] lines=%d elapsed=%.2fms wait=%.2fms",
-		           m_lastBlitStatus.fpgaFrame, m_lastBlitStatus.fpgaVCount,
-		           m_lastBlitStatus.frameEcho, m_lastBlitStatus.vCountEcho,
-		           linesToWait, elapsedMs, waitMs);
-	}
+	LOG->Trace("LowLevelWindow_X11_MiSTer: FPGA[f=%u v=%u] echo[f=%u v=%u] lines=%d avgRender=%.2fms wait=%.2fms",
+	           m_lastBlitStatus.fpgaFrame, m_lastBlitStatus.fpgaVCount,
+	           m_lastBlitStatus.frameEcho, m_lastBlitStatus.vCountEcho,
+	           linesToWait, m_frameTimeAvg, waitMs);
 
-	// Calculate target time from NOW (not from m_timeEntry)
-	// This ensures we wait exactly waitMs from this point
-	auto targetTime = now + std::chrono::microseconds(
-		static_cast<int64_t>(waitMs * 1000.0));
+	// Calculate target time from NOW
+	auto targetTime = std::chrono::steady_clock::now() +
+		std::chrono::microseconds(static_cast<int64_t>(waitMs * 1000.0));
 
 	// Hybrid wait: sleep for bulk, busy-wait for final precision
+	// See GroovyMAME drawnogpu.cpp lines 753-762
 	while (std::chrono::steady_clock::now() < targetTime)
 	{
 		auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -895,6 +954,7 @@ void LowLevelWindow_X11_MiSTer::ResetTimingStats()
 	m_predictiveFrames = 0;
 	m_wallClockFrames = 0;
 	m_lateFrames = 0;
+	m_frameSkips = 0;
 }
 
 void LowLevelWindow_X11_MiSTer::CollectTimingStats(double waitMs, int linesToWait, bool usedPredictive)
@@ -977,6 +1037,15 @@ void LowLevelWindow_X11_MiSTer::LogTimingStats()
 		          100.0 * m_lateFrames / m_predictiveFrames);
 	}
 
+	// Report backpressure frame skips (key indicator of queue buildup)
+	if (m_frameSkips > 0)
+	{
+		LOG->Warn("  Backpressure skips: %d frames (%.2f%%) - FPGA display passed received frames",
+		          m_frameSkips,
+		          100.0 * m_frameSkips / m_timingStatsFrameCount);
+		LOG->Info("  [Frame skips indicate queue buildup was detected and corrected]");
+	}
+
 	// Explain wall-clock fallback if it's happening frequently
 	if (m_wallClockFrames > m_predictiveFrames && m_predictiveSync)
 	{
@@ -986,6 +1055,7 @@ void LowLevelWindow_X11_MiSTer::LogTimingStats()
 
 	// Interpretation help
 	LOG->Info("  [Higher waitMs = more input capture time = lower latency]");
+	LOG->Info("  avgRenderTime=%.2fms (used for render-time compensation)", m_frameTimeAvg);
 
 	// Reset for next interval
 	ResetTimingStats();
