@@ -751,21 +751,19 @@ void LowLevelWindow_X11_MiSTer::CalculateFrameDelay()
 	m_frameDelay = std::max((m_period - margin) / m_period, 0.0);
 
 	// Calculate vsync scanline target
-	// For interlaced mode, we want to target the vblank region
-	// vtotal=525 for NTSC: Field 0 vblank ~240-262, Field 1 vblank ~502-525
-	// Using a high value (near vtotal) works for both fields since the FPGA
-	// handles the field timing internally
-	if (m_interlacedFB)
-	{
-		// Target late in the frame (vblank region) - around 90-95% of vtotal
-		// This gives maximum time for input while staying in safe territory
-		m_vsyncScanline = std::min(static_cast<int>(m_vtotal * 0.95), m_vtotal - 1);
-	}
-	else
-	{
-		// Progressive mode: use frame_delay calculation
-		m_vsyncScanline = std::min(static_cast<int>(m_vtotal * m_frameDelay + 1), m_vtotal);
-	}
+	// This tells the FPGA "wait until scanline X before displaying this frame"
+	// Frame must arrive BEFORE this scanline or tearing occurs.
+	//
+	// Using m_frameDelay for BOTH interlaced and progressive modes ensures the
+	// target adapts to timing jitter. During fast scrolling, jitter increases,
+	// frameDelay decreases, and vsync target moves earlier = more safety margin.
+	//
+	// GroovyMAME drawnogpu.cpp line 901 uses the same formula for all modes:
+	//   m_vsync_scanline = (vtotal * frame_delay) + vsync_offset + 1
+	//
+	// Previous bug: interlaced mode used fixed 95% which didn't adapt to jitter,
+	// causing tearing during fast scrolling (e.g., MAX300 at 300 BPM).
+	m_vsyncScanline = std::min(static_cast<int>(m_vtotal * m_frameDelay + 1), m_vtotal);
 }
 
 bool LowLevelWindow_X11_MiSTer::WaitForVSync()
